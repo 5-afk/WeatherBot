@@ -3,5 +3,4 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 schedule>=1.2.0
 colorlog>=6.8.0
-python-telegram-bot>=20.0
 cryptography>=42.0.0

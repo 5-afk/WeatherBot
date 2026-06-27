@@ -88,15 +88,21 @@ class Trader:
         self.enricher = DataEnricher()
         self.position_sizer = PositionSizer()
         self.risk = RiskManager(DATA_DIR / "positions.db")
+        self._scan_bet_count = 0
+        self._scan_skip_count = 0
         self._ensure_pnl_file()
 
     def run_full_pipeline(self) -> None:
         """Run one full market scan from Kalshi through order/dry-run action."""
+        self._scan_bet_count = 0
+        self._scan_skip_count = 0
         logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Full pipeline started. dry_run=%s", self.dry_run)
+        self._send_discord(f"🤖 Bot started scan. DRY_RUN={self.dry_run}")
         for city in self.weather.watched_cities():
             for series_ticker in (city.high_series, city.low_series):
                 self._scan_series(city, series_ticker)
         logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Full pipeline finished.")
+        self._send_discord(f"✅ Scan complete. {self._scan_bet_count} bets placed, {self._scan_skip_count} skipped.")
 
     def _scan_series(self, city: CityConfig, series_ticker: str) -> None:
         """Fetch and process every open market in one city series."""
@@ -104,11 +110,13 @@ class Trader:
             markets = self.kalshi.list_markets(series_ticker)
         except requests.RequestException as exc:
             logging.error("[ERROR] %s | Kalshi fetch failed for %s: %s", city.short_code, series_ticker, exc)
-            self._send_telegram(f"BOT ERROR\nCity: {city.name}\nKalshi fetch failed: {exc}")
+            self._scan_skip_count += 1
+            self._send_discord(f"BOT ERROR\nCity: {city.name}\nKalshi fetch failed: {exc}")
             return
 
         if not markets:
             logging.info("[SKIP] %s | No open markets for %s", city.short_code, series_ticker)
+            self._scan_skip_count += 1
             return
 
         for market in markets:
@@ -129,7 +137,8 @@ class Trader:
                 confidence=None,
                 market_price=None,
             )
-            self._send_telegram(f"BOT ERROR\nMarket: {market.ticker}\nReason: {exc}")
+            self._scan_skip_count += 1
+            self._send_discord(f"BOT ERROR\nMarket: {market.ticker}\nReason: {exc}")
 
     def _process_market_inner(self, city: CityConfig, market: KalshiMarket) -> None:
         """Run data fetches, filters, Claude, risk checks, and order handling."""
@@ -178,7 +187,7 @@ class Trader:
         if not risk_check.allowed:
             self._log_skip(city, market, risk_check.reason, edge_decision)
             if risk_check.alert:
-                self._send_telegram(f"RISK HALT\nMarket: {market.ticker}\nReason: {risk_check.reason}")
+                self._send_risk_alert(risk_check.reason)
             return
 
         if self.dry_run:
@@ -226,6 +235,7 @@ class Trader:
             confidence=edge.confidence,
             market_price=edge.ask_price,
         )
+        self._scan_bet_count += 1
         self._append_pnl_position(city, market, edge, size, dry_run=True)
         self._send_bet_alert(city, edge, size, dry_run=True)
 
@@ -285,6 +295,7 @@ class Trader:
             confidence=edge.confidence,
             market_price=edge.ask_price,
         )
+        self._scan_bet_count += 1
         self._append_pnl_position(city, market, edge, size, dry_run=False)
         self._send_bet_alert(city, edge, size, dry_run=False)
 
@@ -307,6 +318,7 @@ class Trader:
             f"${market_price:.2f}" if market_price is not None else "n/a",
             reason,
         )
+        self._scan_skip_count += 1
         self.risk.record_decision(
             ticker=market.ticker,
             city=city.name,
@@ -399,28 +411,55 @@ class Trader:
             return {"realized_pnl": 0.0, "open_risk": 0.0, "open_positions": []}
 
     def _send_bet_alert(self, city: CityConfig, edge: EdgeDecision, size: PositionSize, *, dry_run: bool) -> None:
-        """Send a Telegram alert for a placed or simulated bet."""
-        prefix = "DRY RUN BET" if dry_run else "🌤 BET PLACED"
-        self._send_telegram(
+        """Send a readable Discord alert for a placed or simulated bet."""
+        prefix = "🧪 DRY RUN" if dry_run else "💰 BET PLACED"
+        self._send_discord(
             f"{prefix}\n"
             f"City: {city.name}\n"
             f"Bet: {(edge.side or '').upper()} ${size.stake:.2f} @ ${edge.limit_price:.2f}\n"
             f"Edge: {(edge.edge or 0.0):.1%}\n"
-            f"Settles: {edge.hours_until_settlement:.1f} hours"
+            f"Confidence: {edge.confidence:.1%}\n"
+            f"Contracts: {size.contracts}\n"
+            f"Profit if win: ${size.contracts * (1 - (edge.limit_price or 0)):.2f}\n"
+            f"Settles in: {edge.hours_until_settlement:.1f} hours"
         )
 
-    def _send_telegram(self, message: str) -> None:
-        """Send an optional Telegram alert using env-configured credentials."""
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        if not token or not chat_id or token == "your_token_here":
+    def _send_risk_alert(self, reason: str) -> None:
+        """Send a Discord alert for hard risk-stop events."""
+        if reason.startswith("Daily loss limit hit"):
+            daily_loss = abs(min(0.0, self.risk.realized_pnl_today()))
+            self._send_discord(f"⛔ DAILY LOSS LIMIT HIT\nBot stopped trading for today.\nLoss: ${daily_loss:.2f}")
+        elif "Permanent halt" in reason or "Max drawdown" in reason:
+            self._send_discord("🚨 PERMANENT HALT\nMax drawdown reached. Manual restart required.")
+        else:
+            self._send_discord(f"RISK HALT\nReason: {reason}")
+
+    def send_win_alert(self, city: str, side: str, profit: float) -> None:
+        """Send a Discord win alert when a settlement process records a win."""
+        running_pnl = self.risk.current_balance() - self.risk.starting_balance
+        self._send_discord(f"✅ WIN +${profit:.2f}\n{city} resolved {side}\nRunning P&L: ${running_pnl:.2f}")
+
+    def _send_discord(self, message: str) -> None:
+        """Send an alert to a private Discord channel."""
+        token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+        channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
+        if not token or not channel_id or token == "your_token_here":
             return
         try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": message},
-                timeout=10,
-            )
-            response.raise_for_status()
+            url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+            headers = {
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+            }
+            # Discord has a 2000 character limit per message
+            chunks = [message[i:i+1900] for i in range(0, len(message), 1900)]
+            for chunk in chunks:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json={"content": f"```\n{chunk}\n```"},
+                    timeout=10,
+                )
+                response.raise_for_status()
         except requests.RequestException as exc:
-            logging.warning("Telegram alert failed: %s", exc)
+            logging.warning("Discord alert failed: %s", exc)
