@@ -1,0 +1,9 @@
+.env
+data/
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+kalshi_private_key.pem
