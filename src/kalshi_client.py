@@ -182,10 +182,10 @@ class KalshiClient:
             series_ticker=str(raw.get("series_ticker", "")),
             title=str(raw.get("title", "")),
             subtitle=str(raw.get("subtitle", "")),
-            yes_bid=self._price_to_dollars(raw.get("yes_bid")),
-            yes_ask=self._price_to_dollars(raw.get("yes_ask")),
-            no_bid=self._price_to_dollars(raw.get("no_bid")),
-            no_ask=self._price_to_dollars(raw.get("no_ask")),
+            yes_bid=self._price_to_dollars(raw.get("yes_bid_dollars")),
+            yes_ask=self._price_to_dollars(raw.get("yes_ask_dollars")),
+            no_bid=self._price_to_dollars(raw.get("no_bid_dollars")),
+            no_ask=self._price_to_dollars(raw.get("no_ask_dollars")),
             close_time=self._parse_time(raw.get("close_time")),
             settlement_time=self._parse_time(raw.get("settlement_time") or raw.get("expected_expiration_time")),
             raw=raw,
@@ -200,10 +200,10 @@ class KalshiClient:
             number = float(value)
         except (TypeError, ValueError):
             return None
-        if 0 <= number <= 1:
-            return round(number, 4)
-        if number > 1:
-            return round(number / 100, 4)
+        if 0 <= number <= 1.0:
+            return number
+        if number > 1.0:
+            return number / 100
         return None
 
     @staticmethod

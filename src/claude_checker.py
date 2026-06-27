@@ -29,9 +29,15 @@ class ClaudeChecker:
 
     SYSTEM_PROMPT = (
         "You are a trading risk checker for a Kalshi weather prediction market bot. "
-        "You will receive weather forecast data and a proposed bet. Respond with "
-        "only JSON: {decision: 'GO' or 'NOGO', reason: 'one sentence'}. Be "
-        "conservative -- only approve bets with strong data agreement."
+        "You receive weather forecast data, real-time station observations, active NWS alerts, "
+        "and web context about current conditions. "
+        "Respond with only JSON: {\"decision\": \"GO\" or \"NOGO\", \"reason\": \"one sentence\"}. "
+        "Be conservative. Approve bets only when: ensemble models strongly agree, "
+        "NWS confirms direction, no severe weather alerts are active, "
+        "current station temperature supports the forecast, "
+        "and web context shows no unusual events. "
+        "Reject if: severe/extreme alerts are active, models disagree with current conditions, "
+        "or web context mentions unexpected weather events."
     )
 
     def __init__(self) -> None:
@@ -44,7 +50,6 @@ class ClaudeChecker:
         """Send the proposed bet to Claude and return GO or NOGO."""
         if not self.api_key or self.api_key == "your_key_here":
             return ClaudeDecision("NOGO", "Anthropic API key is not configured.")
-
         try:
             client = Anthropic(api_key=self.api_key)
             message = client.messages.create(
@@ -53,20 +58,37 @@ class ClaudeChecker:
                 system=self.SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": json.dumps(payload, indent=2, default=str)}],
             )
-            text = self._extract_text(message)
+            # Extract text safely from response
+            text = ""
+            for block in message.content:
+                if hasattr(block, "text") and block.text:
+                    text = block.text.strip()
+                    break
+            if not text:
+                return ClaudeDecision("NOGO", "Claude returned empty response.")
+            # Strip markdown code fences if present
+            text = text.strip()
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
             parsed = json.loads(text)
             decision = str(parsed.get("decision", "NOGO")).upper()
-            reason = str(parsed.get("reason", "Claude did not provide a reason."))
+            reason = str(parsed.get("reason", "No reason provided."))
             if decision not in {"GO", "NOGO"}:
-                return ClaudeDecision("NOGO", "Claude returned an invalid decision.")
+                return ClaudeDecision("NOGO", "Claude returned invalid decision.")
             return ClaudeDecision(decision, reason)
+        except json.JSONDecodeError as exc:
+            logging.warning("Claude JSON parse failed: %s | raw text: %s", exc, text[:200] if text else "empty")
+            return ClaudeDecision("NOGO", f"Claude JSON parse failed: {exc}")
         except Exception as exc:
             logging.warning("Claude sanity check failed safe: %s", exc)
             return ClaudeDecision("NOGO", f"Claude API failed safe: {exc}")
 
     def _extract_text(self, message: Any) -> str:
-        """Extract the text block from an Anthropic SDK response."""
+        """Extract the first non-empty text block from an Anthropic response."""
         parts = getattr(message, "content", [])
-        if not parts:
-            return "{}"
-        return str(getattr(parts[0], "text", "{}")).strip()
+        for part in parts:
+            text = getattr(part, "text", None)
+            if text and text.strip():
+                return text.strip()
+        return '{"decision": "NOGO", "reason": "Empty response from Claude."}'

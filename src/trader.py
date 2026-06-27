@@ -13,6 +13,7 @@ import colorlog
 import requests
 
 from src.claude_checker import ClaudeChecker, ClaudeDecision
+from src.data_enricher import DataEnricher
 from src.edge_engine import EdgeDecision, EdgeEngine
 from src.kalshi_client import KalshiClient, KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
@@ -84,6 +85,7 @@ class Trader:
         self.weather = WeatherClient()
         self.edge_engine = EdgeEngine()
         self.claude = ClaudeChecker()
+        self.enricher = DataEnricher()
         self.position_sizer = PositionSizer()
         self.risk = RiskManager(DATA_DIR / "positions.db")
         self._ensure_pnl_file()
@@ -152,7 +154,8 @@ class Trader:
             self._log_skip(city, market, edge_decision.reason, edge_decision)
             return
 
-        claude_payload = self._claude_payload(city, market, edge_decision, gfs, ecmwf, nws)
+        enrichment = self.enricher.enrich(city, target_date.isoformat())
+        claude_payload = self._claude_payload(city, market, edge_decision, gfs, ecmwf, nws, enrichment)
         claude_decision = self.claude.check(claude_payload)
         logging.info("Claude market=%s decision=%s reason=%s", market.ticker, claude_decision.decision, claude_decision.reason)
         if not claude_decision.approved:
@@ -322,6 +325,7 @@ class Trader:
         gfs: EnsembleForecast,
         ecmwf: EnsembleForecast,
         nws: NwsForecast,
+        enrichment: dict[str, Any],
     ) -> dict[str, Any]:
         """Build the full data payload required by the Claude checker."""
         settlement = market.settlement_time or market.close_time
@@ -342,6 +346,11 @@ class Trader:
             "edge_percentage": None if edge.edge is None else round(edge.edge * 100, 2),
             "confidence_score": round(edge.confidence * 100, 2),
             "hours_until_settlement": edge.hours_until_settlement,
+            "active_weather_alerts": enrichment.get("active_alerts", []),
+            "has_severe_alert": enrichment.get("has_severe_alert", False),
+            "current_temp_f": enrichment.get("current_temp_f"),
+            "current_observation": enrichment.get("current_observation", {}),
+            "web_context": enrichment.get("web_context", ""),
         }
 
     def _append_pnl_position(

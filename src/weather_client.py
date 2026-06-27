@@ -117,7 +117,6 @@ class WeatherClient:
             "temperature_unit": "fahrenheit",
             "forecast_days": 3,
             "models": model_name,
-            "ensemble": "true",
         }
         response = self.session.get(self.OPEN_METEO_ENSEMBLE_URL, params=params, timeout=self.timeout_seconds)
         response.raise_for_status()
