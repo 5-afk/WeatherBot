@@ -80,6 +80,8 @@ class Trader:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self.dry_run = env_bool("DRY_RUN", True)
+        self.paused = False
+        self.last_scan_time: datetime | None = None
         self.pnl_path = DATA_DIR / "pnl.json"
         self.kalshi = KalshiClient()
         self.weather = WeatherClient()
@@ -94,6 +96,11 @@ class Trader:
 
     def run_full_pipeline(self) -> None:
         """Run one full market scan from Kalshi through order/dry-run action."""
+        if self.paused:
+            logging.info("[CYCLE] Bot is paused — skipping scan.")
+            return
+
+        self.last_scan_time = datetime.now()
         self._scan_bet_count = 0
         self._scan_skip_count = 0
         logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Full pipeline started. dry_run=%s", self.dry_run)

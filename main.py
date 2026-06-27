@@ -12,6 +12,7 @@ import logging
 
 from dotenv import load_dotenv
 
+from src.discord_commander import DiscordCommander
 from src.nws_watcher import NWSWatcher
 from src.trader import CYCLE_LEVEL, Trader, configure_logging, env_bool
 
@@ -24,6 +25,9 @@ def main() -> None:
     trader = Trader()
     watcher = NWSWatcher(trader.run_full_pipeline)
     watcher.register_jobs()
+    commander = DiscordCommander(trader.run_full_pipeline, trader)
+    commander.start_in_background()
+    logging.info("Discord commander started — listening for commands.")
 
     logging.info("Kalshi weather bot started. DRY_RUN=%s", trader.dry_run)
     if env_bool("RUN_ON_START", True):

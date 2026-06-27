@@ -197,14 +197,28 @@ class EdgeEngine:
 
     def parse_threshold(self, market: KalshiMarket) -> float | None:
         """Extract one Fahrenheit threshold from the market title/subtitle."""
+        market_type = self.market_type(market)
         text = f"{market.title} {market.subtitle}"
-        matches = re.findall(r"(-?\d+(?:\.\d+)?)\s*(?:°|degrees?|f\b|fahrenheit)?", text, re.IGNORECASE)
+        # Only match numbers that look like temperatures (not dates or IDs)
+        matches = re.findall(
+            r"(?<![A-Z0-9])(-?\d+(?:\.\d+)?)\s*(?:°|degrees?|F\b|fahrenheit\b)",
+            text,
+            re.IGNORECASE,
+        )
+        if not matches:
+            # Fallback: find the last standalone number in the subtitle only
+            matches = re.findall(r"(?<![A-Z0-9])(\d+(?:\.\d+)?)(?![A-Z0-9])", market.subtitle, re.IGNORECASE)
         if not matches:
             return None
-        # Kalshi weather titles usually contain one settlement temperature. If
-        # several numbers appear, prefer the one followed by degree-like text.
-        degree_match = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:°|degrees?|f\b|fahrenheit)", text, re.IGNORECASE)
-        return float(degree_match.group(1)) if degree_match else float(matches[-1])
+
+        threshold = float(matches[-1])
+        # KXHIGH markets can never have negative thresholds in summer cities
+        # Negative values indicate a parsing error — return None to skip
+        if market_type == "high" and threshold is not None and threshold < 0:
+            return None
+        if market_type == "low" and threshold is not None and threshold < -50:
+            return None
+        return threshold
 
     def hours_until_settlement(self, settlement_time: datetime | None) -> float | None:
         """Calculate hours from now until settlement in UTC."""
