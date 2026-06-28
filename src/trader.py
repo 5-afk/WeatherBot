@@ -157,6 +157,22 @@ class Trader:
 
     def _process_market_inner(self, city: CityConfig, market: KalshiMarket) -> None:
         """Run data fetches, filters, Claude, risk checks, and order handling."""
+        # Always verify real balance before processing any market
+        if not self.dry_run:
+            real_balance = self.kalshi.get_balance()
+            if real_balance is None:
+                logging.error("Could not fetch Kalshi balance — skipping scan for safety")
+                self._send_discord("⚠️ Could not verify Kalshi balance — scan skipped for safety")
+                return
+            if real_balance < 1.0:
+                logging.warning("Kalshi balance too low: $%.2f — stopping bot", real_balance)
+                self._send_discord(f"⛔ Balance too low to trade: ${real_balance:.2f}")
+                self.paused = True
+                return
+            # Sync the real balance as today's budget
+            self.risk._set_state("running_budget", str(real_balance))
+            logging.info("Balance verified: $%.2f", real_balance)
+
         settlement_time = market.settlement_time or market.close_time
         if settlement_time is None:
             self._log_skip(city, market, "No settlement time available.", None)
@@ -180,11 +196,6 @@ class Trader:
 
         enrichment = self.enricher.enrich(city, target_date.isoformat())
         claude_payload = self._claude_payload(city, market, edge_decision, gfs, ecmwf, nws, enrichment)
-        claude_decision = self.claude.check(claude_payload)
-        logging.info("Claude market=%s decision=%s reason=%s", market.ticker, claude_decision.decision, claude_decision.reason)
-        if not claude_decision.approved:
-            self._log_skip(city, market, f"Claude NOGO: {claude_decision.reason}", edge_decision)
-            return
 
         current_budget = self.risk.get_todays_budget()
         if current_budget < 1.0:
@@ -202,6 +213,15 @@ class Trader:
         )
         if size.contracts < 1:
             self._log_skip(city, market, size.reason, edge_decision)
+            return
+
+        claude_payload["proposed_stake"] = size.stake
+        # Pass real balance to Claude so it knows the stakes
+        real_balance = self.kalshi.get_balance() if not self.dry_run else None
+        claude_decision = self.claude.check(claude_payload, balance=real_balance)
+        logging.info("Claude market=%s decision=%s reason=%s", market.ticker, claude_decision.decision, claude_decision.reason)
+        if not claude_decision.approved:
+            self._log_skip(city, market, f"Claude NOGO: {claude_decision.reason}", edge_decision)
             return
 
         risk_check = self.risk.can_trade(market.ticker, size.stake)

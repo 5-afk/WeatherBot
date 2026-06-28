@@ -173,15 +173,29 @@ class KalshiClient:
             return {}
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.asymmetric import rsa
         import time, base64
         from pathlib import Path
 
         timestamp = str(int(time.time() * 1000))
-        message = f"{timestamp}{method.upper()}{path}".encode("utf-8")
-        # Load private key from file path stored in api_secret
+
+        # Path must include /trade-api/v2 prefix but strip query params
+        # e.g. path="/markets" -> sign "/trade-api/v2/markets"
+        # e.g. path="/trade-api/v2/markets" -> sign as-is
+        if not path.startswith("/trade-api"):
+            sign_path = f"/trade-api/v2{path}"
+        else:
+            sign_path = path
+        # Strip query string - never include ? params in signature
+        sign_path = sign_path.split("?")[0]
+
+        message = f"{timestamp}{method.upper()}{sign_path}".encode("utf-8")
+
+        # Load private key from file path
         key_path = Path(self.api_secret)
         if not key_path.is_absolute():
             key_path = Path(__file__).resolve().parents[1] / key_path
+
         private_key = serialization.load_pem_private_key(
             key_path.read_bytes(), password=None
         )

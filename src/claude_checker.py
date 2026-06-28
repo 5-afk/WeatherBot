@@ -33,6 +33,9 @@ class ClaudeChecker:
         "This is the most important trade of the day — be extra conservative. "
         "You receive weather forecast data, real-time station observations, "
         "active NWS alerts, and web context. "
+        "You will receive the account balance and what percentage of it this bet represents. "
+        "Reject any bet that represents more than 80% of the account balance. "
+        "Be extra conservative when account balance is below $50. "
         "Respond with ONLY raw JSON, no markdown, no code fences: "
         "{\"decision\": \"GO\" or \"NOGO\", \"reason\": \"one sentence\"}. "
         "Approve ONLY when: both models strongly agree (>75% confidence), "
@@ -48,8 +51,13 @@ class ClaudeChecker:
         self.model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5").strip()
         self.max_tokens = 120
 
-    def check(self, payload: dict[str, Any]) -> ClaudeDecision:
+    def check(self, payload: dict[str, Any], balance: float | None = None) -> ClaudeDecision:
         """Send the proposed bet to Claude and return GO or NOGO."""
+        if balance is not None:
+            payload["account_balance_usd"] = round(balance, 2)
+            payload["bet_as_pct_of_balance"] = round(
+                (payload.get("proposed_stake", 0) / balance * 100), 1
+            ) if balance > 0 else None
         if not self.api_key or self.api_key == "your_key_here":
             return ClaudeDecision("NOGO", "Anthropic API key is not configured.")
         try:

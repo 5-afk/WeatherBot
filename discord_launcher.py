@@ -134,6 +134,20 @@ class BotLauncher:
             log_text = launcher._last_log_lines()
             await ctx.send(f"📋 Last 20 log lines:\n{log_text}"[:1900])
 
+        @self.bot.command(name="balance")
+        async def balance_cmd(ctx):
+            """Fetch and show the real Kalshi account balance."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            from src.kalshi_client import KalshiClient
+
+            k = KalshiClient()
+            b = k.get_balance()
+            if b:
+                await ctx.send(f"💰 Kalshi Balance: **${b:.2f}**")
+            else:
+                await ctx.send("⚠️ Could not fetch balance")
+
         @self.bot.command(name="help")
         async def help_command(ctx):
             """Show all launcher commands."""
@@ -143,6 +157,7 @@ class BotLauncher:
                 "!stop    — stop the trading bot\n"
                 "!restart — restart the trading bot\n"
                 "!status  — check if bot is running\n"
+                "!balance — show real Kalshi account balance\n"
                 "!logs    — show last 20 log lines\n"
                 "!pocket  — show pocketed profits\n"
                 "!budget  — show compounding budget\n"
