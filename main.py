@@ -9,32 +9,39 @@ missed while the computer is asleep or the process is restarting.
 from __future__ import annotations
 
 import logging
+import time
 
+import schedule
 from dotenv import load_dotenv
 
 from src.discord_commander import DiscordCommander
 from src.nws_watcher import NWSWatcher
-from src.trader import CYCLE_LEVEL, Trader, configure_logging, env_bool
+from src.trader import Trader, configure_logging
 
 
 def main() -> None:
-    """Load configuration, create the trader, and start the NWS watcher."""
+    """Load config, start bot, restart automatically on crash."""
     load_dotenv()
     configure_logging()
+    logging.info("Starting KalshiBot...")
 
-    trader = Trader()
-    watcher = NWSWatcher(trader.run_full_pipeline)
-    watcher.register_jobs()
-    commander = DiscordCommander(trader.run_full_pipeline, trader)
-    commander.start_in_background()
-    logging.info("Discord commander started — listening for commands.")
-
-    logging.info("Kalshi weather bot started. DRY_RUN=%s", trader.dry_run)
-    if env_bool("RUN_ON_START", True):
-        logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Startup scan requested -- running full pipeline")
-        trader.run_full_pipeline()
-
-    watcher.run_forever()
+    while True:
+        try:
+            schedule.clear()
+            trader = Trader()
+            watcher = NWSWatcher(trader.run_full_pipeline)
+            watcher.register_jobs()
+            commander = DiscordCommander(trader.run_full_pipeline, trader)
+            commander.start_in_background()
+            logging.info("Discord commander started — listening for commands.")
+            logging.info("Kalshi weather bot started. DRY_RUN=%s", trader.dry_run)
+            watcher.run_forever()
+        except KeyboardInterrupt:
+            logging.info("KalshiBot stopped by user.")
+            break
+        except Exception as exc:
+            logging.exception("KalshiBot crashed; restarting in 60 seconds: %s", exc)
+            time.sleep(60)
 
 
 if __name__ == "__main__":

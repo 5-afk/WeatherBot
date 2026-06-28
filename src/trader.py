@@ -97,27 +97,52 @@ class Trader:
             logging.info("Kalshi balance synced: $%.2f", real_balance)
         else:
             logging.warning("Could not fetch Kalshi balance — keeping local budget")
-        self._scan_bet_count = 0
-        self._scan_skip_count = 0
         self._ensure_pnl_file()
 
     def run_full_pipeline(self) -> None:
-        """Run one full market scan from Kalshi through order/dry-run action."""
+        """Run one full market scan and post a summary to Discord."""
+        self.last_scan_time = datetime.now(timezone.utc)
         if self.paused:
             logging.info("[CYCLE] Bot is paused — skipping scan.")
             return
 
-        self.last_scan_time = datetime.now()
-        self._scan_bet_count = 0
-        self._scan_skip_count = 0
-        logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Full pipeline started. dry_run=%s", self.dry_run)
-        self._send_discord(f"🤖 Bot started scan. DRY_RUN={self.dry_run}")
+        logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Pipeline started. dry_run=%s", self.dry_run)
+
+        # Track scan stats
+        self._scan_bets = 0
+        self._scan_skips = 0
+        self._scan_signals = 0  # markets that passed math but failed Claude
+
         for city in self.weather.watched_cities():
             for series_ticker in (city.high_series, city.low_series):
                 self._scan_series(city, series_ticker)
         self._maybe_record_day_end()
-        logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Full pipeline finished.")
-        self._send_discord(f"✅ Scan complete. {self._scan_bet_count} bets placed, {self._scan_skip_count} skipped.")
+        logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Pipeline finished.")
+
+        # Post scan summary to Discord
+        balance = self.kalshi.get_balance() if not self.dry_run else None
+        balance_str = f"${balance:.2f}" if balance else "n/a"
+        mode = "🧪 DRY RUN" if self.dry_run else "💰 LIVE"
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        next_scan = "in 30 min"
+
+        if self._scan_bets > 0:
+            summary = (
+                f"📊 Scan complete [{now}] | {mode}\n"
+                f"✅ Bets placed: {self._scan_bets}\n"
+                f"⏭️ Skipped: {self._scan_skips}\n"
+                f"💰 Balance: {balance_str}\n"
+                f"🕐 Next scan: {next_scan}"
+            )
+        else:
+            summary = (
+                f"📊 Scan complete [{now}] | {mode}\n"
+                f"🔍 No qualifying signals\n"
+                f"⏭️ Markets checked: {self._scan_skips}\n"
+                f"💰 Balance: {balance_str}\n"
+                f"🕐 Next scan: {next_scan}"
+            )
+        self._send_discord(summary)
 
     def _scan_series(self, city: CityConfig, series_ticker: str) -> None:
         """Fetch and process every open market in one city series."""
@@ -125,13 +150,13 @@ class Trader:
             markets = self.kalshi.list_markets(series_ticker)
         except requests.RequestException as exc:
             logging.error("[ERROR] %s | Kalshi fetch failed for %s: %s", city.short_code, series_ticker, exc)
-            self._scan_skip_count += 1
+            self._scan_skips = getattr(self, "_scan_skips", 0) + 1
             self._send_discord(f"BOT ERROR\nCity: {city.name}\nKalshi fetch failed: {exc}")
             return
 
         if not markets:
             logging.info("[SKIP] %s | No open markets for %s", city.short_code, series_ticker)
-            self._scan_skip_count += 1
+            self._scan_skips = getattr(self, "_scan_skips", 0) + 1
             return
 
         for market in markets:
@@ -152,7 +177,7 @@ class Trader:
                 confidence=None,
                 market_price=None,
             )
-            self._scan_skip_count += 1
+            self._scan_skips = getattr(self, "_scan_skips", 0) + 1
             self._send_discord(f"BOT ERROR\nMarket: {market.ticker}\nReason: {exc}")
 
     def _process_market_inner(self, city: CityConfig, market: KalshiMarket) -> None:
@@ -218,6 +243,7 @@ class Trader:
         claude_payload["proposed_stake"] = size.stake
         # Pass real balance to Claude so it knows the stakes
         real_balance = self.kalshi.get_balance() if not self.dry_run else None
+        self._scan_signals = getattr(self, "_scan_signals", 0) + 1
         claude_decision = self.claude.check(claude_payload, balance=real_balance)
         logging.info("Claude market=%s decision=%s reason=%s", market.ticker, claude_decision.decision, claude_decision.reason)
         if not claude_decision.approved:
@@ -276,7 +302,7 @@ class Trader:
             confidence=edge.confidence,
             market_price=edge.ask_price,
         )
-        self._scan_bet_count += 1
+        self._scan_bets = getattr(self, "_scan_bets", 0) + 1
         self._append_pnl_position(city, market, edge, size, dry_run=True)
         self._send_bet_alert(city, edge, size, dry_run=True)
 
@@ -336,7 +362,7 @@ class Trader:
             confidence=edge.confidence,
             market_price=edge.ask_price,
         )
-        self._scan_bet_count += 1
+        self._scan_bets = getattr(self, "_scan_bets", 0) + 1
         self._append_pnl_position(city, market, edge, size, dry_run=False)
         self._send_bet_alert(city, edge, size, dry_run=False)
 
@@ -359,7 +385,7 @@ class Trader:
             f"${market_price:.2f}" if market_price is not None else "n/a",
             reason,
         )
-        self._scan_skip_count += 1
+        self._scan_skips = getattr(self, "_scan_skips", 0) + 1
         self.risk.record_decision(
             ticker=market.ticker,
             city=city.name,
@@ -473,7 +499,7 @@ class Trader:
         """Send a readable Discord alert for a placed or simulated bet."""
         prefix = "🧪 DRY RUN" if dry_run else "💰 BET PLACED"
         self._send_discord(
-            f"{prefix}\n"
+            f"{self._user_ping()}{prefix}\n"
             f"City: {city.name}\n"
             f"Bet: {(edge.side or '').upper()} ${size.stake:.2f} @ ${edge.limit_price:.2f}\n"
             f"Edge: {(edge.edge or 0.0):.1%}\n"
@@ -487,16 +513,23 @@ class Trader:
         """Send a Discord alert for hard risk-stop events."""
         if reason.startswith("Daily loss limit hit"):
             daily_loss = abs(min(0.0, self.risk.realized_pnl_today()))
-            self._send_discord(f"⛔ DAILY LOSS LIMIT HIT\nBot stopped trading for today.\nLoss: ${daily_loss:.2f}")
+            self._send_discord(f"{self._user_ping()}⛔ DAILY LOSS LIMIT HIT\nBot stopped trading for today.\nLoss: ${daily_loss:.2f}")
         elif "Permanent halt" in reason or "Max drawdown" in reason:
-            self._send_discord("🚨 PERMANENT HALT\nMax drawdown reached. Manual restart required.")
+            self._send_discord(f"{self._user_ping()}🚨 PERMANENT HALT\nMax drawdown reached. Manual restart required.")
         else:
-            self._send_discord(f"RISK HALT\nReason: {reason}")
+            self._send_discord(f"{self._user_ping()}RISK HALT\nReason: {reason}")
 
     def send_win_alert(self, city: str, side: str, profit: float) -> None:
         """Send a Discord win alert when a settlement process records a win."""
         running_pnl = self.risk.current_balance() - self.risk.starting_balance
-        self._send_discord(f"✅ WIN +${profit:.2f}\n{city} resolved {side}\nRunning P&L: ${running_pnl:.2f}")
+        self._send_discord(f"{self._user_ping()}✅ WIN +${profit:.2f}\n{city} resolved {side}\nRunning P&L: ${running_pnl:.2f}")
+
+    def _user_ping(self) -> str:
+        """Return a Discord user mention string for notifications."""
+        user_id = os.getenv("DISCORD_USER_ID", "").strip()
+        if user_id:
+            return f"<@{user_id}>\n"
+        return ""
 
     def _send_discord(self, message: str) -> None:
         """Send an alert to a private Discord channel."""
