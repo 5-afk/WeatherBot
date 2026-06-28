@@ -38,8 +38,9 @@ class EdgeEngine:
         """Read edge-engine thresholds from environment variables."""
         self.min_edge = float(os.getenv("MIN_EDGE", "0.10"))
         self.min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.70"))
-        self.min_price = float(os.getenv("MIN_CONTRACT_PRICE", "0.15"))
+        self.min_price = float(os.getenv("MIN_CONTRACT_PRICE", "0.30"))
         self.max_price = float(os.getenv("MAX_CONTRACT_PRICE", "0.85"))
+        self.denver_min_edge = float(os.getenv("DENVER_MIN_EDGE", "0.15"))
         self.settlement_window_hours = float(os.getenv("SETTLEMENT_WINDOW_HOURS", "24"))
         self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
         self.expected_members = {
@@ -133,8 +134,9 @@ class EdgeEngine:
         model_probability = self._model_probability_for_side(gfs_yes, ecmwf_yes, side)
         edge = model_probability - ask_price
         confidence = self._confidence_for_side(gfs_yes, ecmwf_yes, side)
+        required_edge = self._required_edge(market)
 
-        if edge <= self.min_edge:
+        if edge <= required_edge:
             return EdgeDecision(
                 False,
                 side,
@@ -143,7 +145,7 @@ class EdgeEngine:
                 model_probability,
                 edge,
                 confidence,
-                f"Edge {edge:.1%} is below 10% threshold.",
+                f"Edge {edge:.1%} is below required {required_edge:.1%} threshold.",
                 market_type,
                 threshold,
                 gfs_yes,
@@ -231,6 +233,11 @@ class EdgeEngine:
         """Return a limit price one cent better than the current ask."""
         del side
         return round(max(0.01, ask_price - 0.01), 2)
+
+    def _required_edge(self, market: KalshiMarket) -> float:
+        """Return the market-specific minimum edge threshold."""
+        ticker_text = f"{market.series_ticker} {market.ticker}".upper()
+        return self.denver_min_edge if "DEN" in ticker_text else self.min_edge
 
     def _member_count_problem(self, gfs: EnsembleForecast, ecmwf: EnsembleForecast) -> str | None:
         """Verify Open-Meteo returned the requested 31 and 51 member ensembles."""

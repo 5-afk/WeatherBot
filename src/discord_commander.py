@@ -70,17 +70,16 @@ class DiscordCommander:
             risk = commander.trader.risk
             daily_pnl = risk.realized_pnl_today()
             open_positions = risk.open_position_count()
-            budget_used = risk.opened_notional_today()
-            daily_loss = abs(min(0.0, daily_pnl))
             mode = "DRY RUN" if commander.trader.dry_run else "LIVE"
             last_scan = commander._format_last_scan()
             await ctx.reply(
                 "🤖 KalshiBot Status\n"
                 f"Mode: {mode}\n"
+                f"Today's budget remaining: ${risk.get_todays_budget():.2f}\n"
+                f"Running budget: ${risk.get_running_budget():.2f} (compounded)\n"
+                f"Total pocketed: ${risk.get_total_pocketed():.2f}\n"
+                f"Open positions: {open_positions} / {risk.max_open_positions}\n"
                 f"Daily P&L: ${daily_pnl:.2f}\n"
-                f"Open positions: {open_positions}\n"
-                f"Daily budget used: ${budget_used:.2f} / ${risk.daily_budget:.2f}\n"
-                f"Daily loss limit: ${daily_loss:.2f} / ${risk.daily_loss_limit:.2f}\n"
                 "Bot running: Yes\n"
                 f"Last scan: {last_scan}"
             )
@@ -110,6 +109,30 @@ class DiscordCommander:
                 f"Open positions: {risk.open_position_count()}"
             )
 
+        @self.bot.command(name="pocket")
+        async def pocket(ctx: commands.Context) -> None:
+            """Show total pocketed profits and recent daily breakdown."""
+            risk = commander.trader.risk
+            lines = [f"Total pocketed: ${risk.get_total_pocketed():.2f}"]
+            for row in risk.get_budget_history(7):
+                lines.append(f"{row['created_at'][:10]} pocketed=${row['pocketed']:.2f} profit=${row['gross_profit']:.2f}")
+            await ctx.reply("💰 Pocketed Profits\n" + "\n".join(lines))
+
+        @self.bot.command(name="budget")
+        async def budget(ctx: commands.Context) -> None:
+            """Show current running budget and compounding history."""
+            risk = commander.trader.risk
+            lines = [
+                f"Running budget: ${risk.get_running_budget():.2f}",
+                f"Today's remaining: ${risk.get_todays_budget():.2f}",
+            ]
+            for row in risk.get_budget_history(7):
+                lines.append(
+                    f"{row['created_at'][:10]} profit=${row['gross_profit']:.2f} "
+                    f"reinvested=${row['reinvested']:.2f} budget=${row['running_budget']:.2f}"
+                )
+            await ctx.reply("📈 Budget Compounding\n" + "\n".join(lines))
+
         @self.bot.command(name="help")
         async def help_command(ctx: commands.Context) -> None:
             """Show all available Discord commands."""
@@ -121,8 +144,11 @@ class DiscordCommander:
                 "!pause — pause trading\n"
                 "!resume — resume trading\n"
                 "!help — show this message\n"
+                "!pocket — show pocketed profits\n"
+                "!budget — show compounding budget\n"
                 "!dryrun on — enable dry run mode\n"
-                "!dryrun off — disable dry run mode"
+                "!dryrun off — disable dry run mode\n"
+                "!golive CONFIRM — switch to live trading"
             )
 
         @self.bot.group(name="dryrun", invoke_without_command=True)
@@ -136,6 +162,17 @@ class DiscordCommander:
                 await ctx.reply("⚠️ Dry run mode OFF. Bot will place REAL trades.")
             else:
                 await ctx.reply("Use `!dryrun on` or `!dryrun off`.")
+
+        @self.bot.command(name="golive")
+        async def golive(ctx: commands.Context, confirmation: str | None = None) -> None:
+            """Switch the in-process bot to live trading after explicit confirmation."""
+            if confirmation != "CONFIRM":
+                await ctx.reply("Type `!golive CONFIRM` to switch to live trading.")
+                return
+            commander.trader.kalshi.switch_to_live()
+            commander.trader.dry_run = False
+            commander._update_env({"KALSHI_ENV": "prod", "DRY_RUN": "false"})
+            await ctx.reply("⚠️ LIVE TRADING ENABLED. KALSHI_ENV=prod and DRY_RUN=false.")
 
     def _format_last_scan(self) -> str:
         """Return the trader's last scan time as readable text."""
@@ -151,3 +188,22 @@ class DiscordCommander:
             return int(raw)
         except ValueError:
             return None
+
+    def _update_env(self, updates: dict[str, str]) -> None:
+        """Update simple KEY=value pairs in the project .env file."""
+        env_path = os.path.join(os.getcwd(), ".env")
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as file:
+                lines = file.read().splitlines()
+        seen = set()
+        for index, line in enumerate(lines):
+            key = line.split("=", 1)[0] if "=" in line else ""
+            if key in updates:
+                lines[index] = f"{key}={updates[key]}"
+                seen.add(key)
+        for key, value in updates.items():
+            if key not in seen:
+                lines.append(f"{key}={value}")
+        with open(env_path, "w", encoding="utf-8") as file:
+            file.write("\n".join(lines) + "\n")

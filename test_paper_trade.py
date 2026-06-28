@@ -236,6 +236,7 @@ def main() -> None:
                     win_probability=min(decision.model_probability or 0.99, 0.99),
                     price=trade_price,
                     confidence=decision.confidence,
+                    current_budget=risk_manager.get_todays_budget(),
                     previous_payout=0.0,
                     last_trade_won=False,
                 )

@@ -108,6 +108,7 @@ class Trader:
         for city in self.weather.watched_cities():
             for series_ticker in (city.high_series, city.low_series):
                 self._scan_series(city, series_ticker)
+        self._maybe_record_day_end()
         logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Full pipeline finished.")
         self._send_discord(f"✅ Scan complete. {self._scan_bet_count} bets placed, {self._scan_skip_count} skipped.")
 
@@ -178,11 +179,17 @@ class Trader:
             self._log_skip(city, market, f"Claude NOGO: {claude_decision.reason}", edge_decision)
             return
 
+        current_budget = self.risk.get_todays_budget()
+        if current_budget < 1.0:
+            self._log_skip(city, market, f"No budget remaining today (${current_budget:.2f})", edge_decision)
+            return
+
         last_won, previous_payout = self.risk.last_trade_state()
         size = self.position_sizer.size_trade(
             win_probability=edge_decision.model_probability or 0.0,
             price=edge_decision.limit_price or edge_decision.ask_price or 0.0,
             confidence=edge_decision.confidence,
+            current_budget=current_budget,
             previous_payout=previous_payout,
             last_trade_won=last_won,
         )
@@ -409,6 +416,24 @@ class Trader:
                 json.dumps({"realized_pnl": 0.0, "open_risk": 0.0, "open_positions": []}, indent=2),
                 encoding="utf-8",
             )
+
+    def _maybe_record_day_end(self) -> None:
+        """Apply daily compounding once after 23:00 UTC."""
+        now = datetime.now(timezone.utc)
+        if now.hour < 23:
+            return
+        today = now.date().isoformat()
+        if self.risk._get_state("last_day_end_date") == today:
+            return
+        gross_profit = self.risk.realized_pnl_today()
+        pocketed = self.risk.record_day_end(gross_profit)
+        self.risk._set_state("last_day_end_date", today)
+        logging.info(
+            "Day-end compounding applied: gross_profit=$%.2f pocketed=$%.2f running_budget=$%.2f",
+            gross_profit,
+            pocketed,
+            self.risk.get_running_budget(),
+        )
 
     def _read_pnl(self) -> dict[str, Any]:
         """Read data/pnl.json with a graceful fallback for bad JSON."""

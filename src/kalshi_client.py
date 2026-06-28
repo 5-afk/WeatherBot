@@ -38,7 +38,7 @@ class KalshiClient:
     """Small REST wrapper around the Kalshi endpoints this bot needs."""
 
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
-    PROD_URL = "https://api.elections.kalshi.com/trade-api/v2"
+    PROD_URL = "https://trading-api.kalshi.com/trade-api/v2"
 
     def __init__(self) -> None:
         """Create one reusable HTTP session and read credentials from env vars."""
@@ -90,7 +90,7 @@ class KalshiClient:
         if not 0.01 <= limit_price <= 0.99:
             raise ValueError("limit_price must be between 0.01 and 0.99")
 
-        price_cents = int(round(limit_price * 100))
+        price_str = f"{limit_price:.4f}"
         body: dict[str, Any] = {
             "ticker": ticker,
             "action": "buy",
@@ -100,11 +100,29 @@ class KalshiClient:
             "client_order_id": str(uuid.uuid4()),
         }
         if side == "yes":
-            body["yes_price"] = price_cents
+            body["yes_price_dollars"] = price_str
         else:
-            body["no_price"] = price_cents
+            body["no_price_dollars"] = price_str
+
+        # Kalshi's 2026 API expects dollar-string fields, not integer cents.
+        body.pop("yes_price", None)
+        body.pop("no_price", None)
 
         return self._request("POST", "/portfolio/orders", json=body, auth_required=True)
+
+    def test_connection(self) -> bool:
+        """Return True when Kalshi reports the exchange is active."""
+        try:
+            data = self._request("GET", "/exchange/status", auth_required=False)
+            return data.get("exchange_active", False)
+        except Exception:
+            return False
+
+    def switch_to_live(self) -> None:
+        """Switch from demo to production environment."""
+        self.base_url = self.PROD_URL
+        self.env = "prod"
+        logging.warning("SWITCHED TO LIVE TRADING — real money at risk")
 
     @property
     def has_credentials(self) -> bool:
