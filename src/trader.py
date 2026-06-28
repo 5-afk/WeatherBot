@@ -90,6 +90,13 @@ class Trader:
         self.enricher = DataEnricher()
         self.position_sizer = PositionSizer()
         self.risk = RiskManager(DATA_DIR / "positions.db")
+        # Always sync real balance from Kalshi on startup
+        real_balance = self.kalshi.get_balance()
+        if real_balance and real_balance > 0:
+            self.risk._set_state("running_budget", str(real_balance))
+            logging.info("Kalshi balance synced: $%.2f", real_balance)
+        else:
+            logging.warning("Could not fetch Kalshi balance — keeping local budget")
         self._scan_bet_count = 0
         self._scan_skip_count = 0
         self._ensure_pnl_file()

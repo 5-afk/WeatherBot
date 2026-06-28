@@ -69,7 +69,7 @@ class RiskManager:
         return RiskCheck(True, "Risk checks passed.")
 
     def get_todays_budget(self) -> float:
-        """Calculate today's available budget based on compounding system."""
+        """Return today's available budget from synced Kalshi balance."""
         base = float(self._get_state("running_budget") or self.starting_balance)
         spent_today = self.opened_notional_today()
         return max(0.0, round(base - spent_today, 2))

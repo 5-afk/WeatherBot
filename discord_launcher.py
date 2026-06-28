@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import logging
 import asyncio
@@ -13,6 +14,9 @@ from pathlib import Path
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
+sys.path.insert(0, os.getcwd())
+from src.kalshi_client import KalshiClient
 
 
 load_dotenv()
@@ -87,6 +91,10 @@ class BotLauncher:
         async def status(ctx):
             """Show launcher and bot process status."""
             dry_run = os.getenv("DRY_RUN", "true")
+            k = KalshiClient()
+            balance = k.get_balance()
+            balance_str = f"${balance:.2f}" if balance else "unavailable"
+            balance_line = f"Kalshi balance: {balance_str}"
             state = launcher._db_status()
             running = "Yes" if launcher._is_running() else "No"
             last_scan = launcher._last_scan_time()
@@ -96,6 +104,7 @@ class BotLauncher:
                     f"Mode: {'DRY RUN' if dry_run.lower() == 'true' else 'LIVE'}\n"
                     f"Today's budget: ${state['todays_budget']:.2f} remaining\n"
                     f"Running budget: ${state['running_budget']:.2f} (compounded)\n"
+                    f"{balance_line}\n"
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
                     f"Open positions: {state['open_positions']} / 1\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
@@ -110,6 +119,7 @@ class BotLauncher:
                     f"Mode: {'DRY RUN' if dry_run.lower() == 'true' else 'LIVE'}\n"
                     f"Today's budget: ${state['todays_budget']:.2f} remaining\n"
                     f"Running budget: ${state['running_budget']:.2f} (compounded)\n"
+                    f"{balance_line}\n"
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
                     f"Open positions: {state['open_positions']} / 1\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
