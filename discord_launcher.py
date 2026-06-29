@@ -11,6 +11,7 @@ import asyncio
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+import zoneinfo
 
 import discord
 from discord.ext import commands, tasks
@@ -24,6 +25,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 PID_FILE = Path("bot.pid")
+ET = zoneinfo.ZoneInfo("America/New_York")
 
 
 def check_single_instance():
@@ -121,6 +123,7 @@ class BotLauncher:
             state = launcher._db_status()
             running = "Yes" if launcher._is_running() else "No"
             last_scan = launcher._last_scan_time()
+            window = launcher._scan_window()
             if launcher._is_running():
                 await ctx.send(
                     "🤖 KalshiBot Status\n"
@@ -131,6 +134,7 @@ class BotLauncher:
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
                     f"Open positions: {state['open_positions']} / 1\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
+                    f"Scan window: {window}\n"
                     f"Bot running: {running}\n"
                     f"Last scan: {last_scan}\n"
                     f"KalshiBot: ✅ Running (PID: {launcher.process.pid})\n"
@@ -146,6 +150,7 @@ class BotLauncher:
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
                     f"Open positions: {state['open_positions']} / 1\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
+                    f"Scan window: {window}\n"
                     f"Bot running: {running}\n"
                     f"Last scan: {last_scan}\n"
                     "KalshiBot: ⛔ Stopped"
@@ -310,6 +315,17 @@ class BotLauncher:
             if "Full pipeline started" in line or "Startup scan requested" in line:
                 return line[:19]
         return "Never"
+
+    def _scan_window(self):
+        """Return the current Eastern-time scan window label."""
+        et_hour = datetime.now(ET).hour
+        if 6 <= et_hour < 14:
+            return "🟢 PRIME (every 5 min)"
+        if 14 <= et_hour < 18:
+            return "🟡 Afternoon (every 15 min)"
+        if 18 <= et_hour < 23:
+            return "🟠 Evening (every 30 min)"
+        return "🔵 Overnight (every 60 min)"
 
     def _db_status(self):
         """Read budget and P&L status directly from SQLite."""
