@@ -125,17 +125,20 @@ class KalshiClient:
         logging.warning("SWITCHED TO LIVE TRADING — real money at risk")
 
     def get_balance(self) -> float | None:
-        """Fetch real account balance in dollars from Kalshi."""
-        try:
-            data = self._request("GET", "/portfolio/balance", auth_required=True)
-            # 2026 format returns balance as dollar string
-            balance = data.get("balance_dollars") or data.get("balance")
-            if balance is not None:
-                return round(float(balance), 2)
-            return None
-        except Exception as exc:
-            logging.warning("Could not fetch balance: %s", exc)
-            return None
+        """Fetch real account balance with retry on connection errors."""
+        import time
+        for attempt in range(3):
+            try:
+                data = self._request("GET", "/portfolio/balance", auth_required=True)
+                balance = data.get("balance_dollars") or data.get("balance")
+                if balance is not None:
+                    return round(float(balance), 2)
+                return None
+            except Exception as exc:
+                logging.warning("Balance fetch attempt %d/3 failed: %s", attempt + 1, exc)
+                if attempt < 2:
+                    time.sleep(5)
+        return None
 
     @property
     def has_credentials(self) -> bool:

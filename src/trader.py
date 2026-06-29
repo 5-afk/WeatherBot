@@ -116,9 +116,12 @@ class Trader:
 
         if not self.dry_run:
             real_balance = self.kalshi.get_balance()
-            if not real_balance or real_balance < 1.0:
-                logging.warning("Balance too low or unavailable — skipping scan")
-                self._send_discord("⚠️ Balance too low or unavailable — scan skipped for safety")
+            if real_balance is None:
+                real_balance = float(self.risk._get_state("running_budget") or 100)
+                logging.warning("Balance fetch failed — using last known: $%.2f", real_balance)
+            if real_balance < 1.0:
+                logging.warning("Balance confirmed too low: $%.2f", real_balance)
+                self._send_discord(f"⛔ Balance too low: ${real_balance:.2f}")
                 return
             self.risk._set_state("running_budget", str(real_balance))
             logging.info("Balance: $%.2f", real_balance)

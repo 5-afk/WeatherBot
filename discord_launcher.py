@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import atexit
 import subprocess
 import logging
 import asyncio
@@ -21,6 +22,28 @@ from src.kalshi_client import KalshiClient
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+PID_FILE = Path("bot.pid")
+
+
+def check_single_instance():
+    """Prevent multiple launcher instances from running at the same time."""
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        except ValueError:
+            old_pid = None
+        if old_pid:
+            try:
+                os.kill(old_pid, 0)
+                print(f"Bot already running (PID {old_pid}). Exiting.")
+                sys.exit(1)
+            except OSError:
+                pass
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+
+atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
 
 
 class BotLauncher:
@@ -392,5 +415,6 @@ class BotLauncher:
 
 
 if __name__ == "__main__":
+    check_single_instance()
     launcher = BotLauncher()
     launcher.run()
