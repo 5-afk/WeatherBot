@@ -159,13 +159,16 @@ class Trader:
             self._scan_skips = getattr(self, "_scan_skips", 0) + 1
             return
 
+        ladder_multiplier = self.edge_engine.calculate_ladder_sum(
+            [market.yes_ask for market in markets if market.yes_ask is not None]
+        )
         for market in markets:
-            self._process_market(city, market)
+            self._process_market(city, market, ladder_multiplier)
 
-    def _process_market(self, city: CityConfig, market: KalshiMarket) -> None:
+    def _process_market(self, city: CityConfig, market: KalshiMarket, ladder_multiplier: float = 1.0) -> None:
         """Handle a single market without letting failures stop the scan."""
         try:
-            self._process_market_inner(city, market)
+            self._process_market_inner(city, market, ladder_multiplier)
         except Exception as exc:
             logging.exception("[ERROR] %s | Market %s failed: %s", city.short_code, market.ticker, exc)
             self.risk.record_decision(
@@ -180,7 +183,7 @@ class Trader:
             self._scan_skips = getattr(self, "_scan_skips", 0) + 1
             self._send_discord(f"BOT ERROR\nMarket: {market.ticker}\nReason: {exc}")
 
-    def _process_market_inner(self, city: CityConfig, market: KalshiMarket) -> None:
+    def _process_market_inner(self, city: CityConfig, market: KalshiMarket, ladder_multiplier: float = 1.0) -> None:
         """Run data fetches, filters, Claude, risk checks, and order handling."""
         # Always verify real balance before processing any market
         if not self.dry_run:
@@ -209,17 +212,26 @@ class Trader:
         try:
             gfs = self.weather.get_ensemble_forecast(city, "gfs", target_date, market_type)
             ecmwf = self.weather.get_ensemble_forecast(city, "ecmwf", target_date, market_type)
+            icon = self.weather.get_ensemble_forecast(city, "icon", target_date, market_type)
             nws = self.weather.get_nws_forecast(city, target_date, market_type)
         except requests.RequestException as exc:
             self._log_skip(city, market, f"Weather API fallback skip: {exc}", None)
             return
 
-        edge_decision = self.edge_engine.evaluate(market, gfs=gfs, ecmwf=ecmwf, nws=nws)
+        enrichment = self.enricher.enrich(city, target_date.isoformat())
+        edge_decision = self.edge_engine.evaluate(
+            market,
+            gfs=gfs,
+            ecmwf=ecmwf,
+            nws=nws,
+            icon=icon,
+            current_temp_f=enrichment.get("current_temp_f"),
+            ladder_multiplier=ladder_multiplier,
+        )
         if not edge_decision.should_trade:
             self._log_skip(city, market, edge_decision.reason, edge_decision)
             return
 
-        enrichment = self.enricher.enrich(city, target_date.isoformat())
         claude_payload = self._claude_payload(city, market, edge_decision, gfs, ecmwf, nws, enrichment)
 
         current_budget = self.risk.get_todays_budget()
@@ -233,6 +245,7 @@ class Trader:
             price=edge_decision.limit_price or edge_decision.ask_price or 0.0,
             confidence=edge_decision.confidence,
             current_budget=current_budget,
+            ladder_multiplier=edge_decision.ladder_multiplier,
             previous_payout=previous_payout,
             last_trade_won=last_won,
         )
@@ -273,14 +286,15 @@ class Trader:
         """Record a simulated bet without calling Kalshi's order endpoint."""
         logging.getLogger().log(
             BET_LEVEL,
-            "[DRY RUN] WOULD BET $%.2f on %s @ $%.2f | %s %.0fF | Edge: %.1f%% | Confidence: %.0f%% | Claude: %s",
-            size.stake,
-            (edge.side or "").upper(),
-            edge.limit_price or 0.0,
+            "[DRY RUN] %s %.0fF | Edge: %.1f%% | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Claude: %s",
             city.short_code,
             edge.threshold_f or 0.0,
             (edge.edge or 0.0) * 100,
-            edge.confidence * 100,
+            edge.signal_score,
+            self._buffer_text(edge),
+            size.stake,
+            (edge.side or "").upper(),
+            edge.limit_price or 0.0,
             claude.decision,
         )
         self.risk.record_open_position(
@@ -333,13 +347,15 @@ class Trader:
         order_id = str(response.get("order", {}).get("order_id") or response.get("order_id") or "")
         logging.getLogger().log(
             BET_LEVEL,
-            "[BET] %s %.0fF | $%.2f on %s @ $%.2f | Edge: %.1f%% | Kelly: $%.2f | Claude: GO -- %s",
+            "[BET] %s %.0fF | Edge: %.1f%% | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Kelly: $%.2f | Claude: GO -- %s",
             city.short_code,
             edge.threshold_f or 0.0,
+            (edge.edge or 0.0) * 100,
+            edge.signal_score,
+            self._buffer_text(edge),
             size.stake,
             (edge.side or "").upper(),
             edge.limit_price or 0.0,
-            (edge.edge or 0.0) * 100,
             size.kelly_size,
             claude.reason,
         )
@@ -378,10 +394,12 @@ class Trader:
         market_price = edge.ask_price if edge else market.yes_ask
         edge_value = edge.edge if edge else None
         logging.warning(
-            "[SKIP] %s %s | Edge: %s | Market: %s | Reason: %s",
+            "[SKIP] %s %s | Edge: %s | Signal: %.2f | Buffer: %s | Market: %s | Reason: %s",
             city.short_code,
             f"{threshold:.0f}F" if threshold is not None else "n/a",
             f"{edge_value:.1%}" if edge_value is not None else "n/a",
+            edge.signal_score if edge else 0.5,
+            self._buffer_text(edge),
             f"${market_price:.2f}" if market_price is not None else "n/a",
             reason,
         )
@@ -396,6 +414,12 @@ class Trader:
             market_price=market_price,
         )
 
+    def _buffer_text(self, edge: EdgeDecision | None) -> str:
+        """Format the forecast-threshold buffer for logs."""
+        if edge is None or edge.nws_adjusted_temperature_f is None or edge.threshold_f is None:
+            return "n/a"
+        return f"{abs(edge.nws_adjusted_temperature_f - edge.threshold_f):.1f}F"
+
     def _claude_payload(
         self,
         city: CityConfig,
@@ -408,6 +432,7 @@ class Trader:
     ) -> dict[str, Any]:
         """Build the full data payload required by the Claude checker."""
         settlement = market.settlement_time or market.close_time
+        threshold = edge.threshold_f
         return {
             "city": city.name,
             "date": settlement.isoformat() if settlement else None,
@@ -430,6 +455,14 @@ class Trader:
             "current_temp_f": enrichment.get("current_temp_f"),
             "current_observation": enrichment.get("current_observation", {}),
             "web_context": enrichment.get("web_context", ""),
+            "buffer_score": edge.buffer_score,
+            "observation_score": edge.observation_score,
+            "signal_score": edge.signal_score,
+            "ladder_multiplier": edge.ladder_multiplier,
+            "icon_probability_yes": edge.icon_probability_yes,
+            "temperature_buffer_f": abs(
+                (nws.temperature_f or threshold) - threshold
+            ) if nws.temperature_f and threshold is not None else None,
         }
 
     def _append_pnl_position(

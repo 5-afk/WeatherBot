@@ -35,6 +35,7 @@ class PositionSizer:
         price: float,
         confidence: float,
         current_budget: float | None = None,
+        ladder_multiplier: float = 1.0,
         previous_payout: float = 0.0,
         last_trade_won: bool = False,
     ) -> PositionSize:
@@ -53,7 +54,7 @@ class PositionSizer:
         confidence_multiplier = min(1.0, (confidence - 0.70) / 0.30 * 0.40 + 0.60)
         # Maps: 0.70 confidence -> 60% of budget, 1.0 confidence -> 100% of budget
 
-        stake = round(min(budget * confidence_multiplier, self.max_bet_usd), 2)
+        stake = round(min(budget * confidence_multiplier * ladder_multiplier, self.max_bet_usd), 2)
 
         # Still apply Kelly as a sanity floor - never bet more than 3x Kelly suggests
         b = (1 - price) / price
@@ -73,7 +74,7 @@ class PositionSizer:
             final_stake,
             contracts,
             round(kelly_size, 2),
-            f"Budget ${budget:.2f} x confidence {confidence_multiplier:.2f} = ${stake:.2f}, "
+            f"Budget ${budget:.2f} x confidence {confidence_multiplier:.2f} x ladder {ladder_multiplier:.2f} = ${stake:.2f}, "
             f"Kelly sanity: ${kelly_size:.2f}.",
         )
 

@@ -29,6 +29,11 @@ class EdgeDecision:
     ecmwf_probability_yes: float | None
     nws_adjusted_temperature_f: float | None
     hours_until_settlement: float | None
+    buffer_score: float = 0.5
+    observation_score: float = 0.5
+    icon_probability_yes: float | None = None
+    ladder_multiplier: float = 1.0
+    signal_score: float = 0.5
 
 
 class EdgeEngine:
@@ -55,6 +60,9 @@ class EdgeEngine:
         gfs: EnsembleForecast,
         ecmwf: EnsembleForecast,
         nws: NwsForecast,
+        icon: EnsembleForecast | None = None,
+        current_temp_f: float | None = None,
+        ladder_multiplier: float = 1.0,
     ) -> EdgeDecision:
         """Return a complete GO/skip decision before Claude and risk checks."""
         market_type = self.market_type(market)
@@ -111,8 +119,43 @@ class EdgeEngine:
                 gfs_yes=gfs_yes,
                 ecmwf_yes=ecmwf_yes,
             )
+        if not self._check_liquidity(market):
+            return self._skip(
+                "Insufficient liquidity at ask price.",
+                market_type,
+                threshold,
+                hours_until_settlement,
+                side=side,
+                ask_price=ask_price,
+                gfs_yes=gfs_yes,
+                ecmwf_yes=ecmwf_yes,
+                ladder_multiplier=ladder_multiplier,
+            )
 
         nws_adjusted = self._adjust_nws_temperature(nws.temperature_f, market_type, settlement_time)
+        buffer_score = self._temperature_buffer_score(nws_adjusted, threshold, market_type, side)
+        if buffer_score == 0.0:
+            return EdgeDecision(
+                False,
+                side,
+                ask_price,
+                self.limit_price(side, ask_price),
+                None,
+                None,
+                self._confidence_for_side(gfs_yes, ecmwf_yes, side),
+                "Temperature buffer is on the wrong side of threshold.",
+                market_type,
+                threshold,
+                gfs_yes,
+                ecmwf_yes,
+                nws_adjusted,
+                hours_until_settlement,
+                buffer_score,
+                0.5,
+                None,
+                ladder_multiplier,
+                0.0,
+            )
         if not self._nws_agrees(nws_adjusted, threshold, market_type, side):
             return EdgeDecision(
                 False,
@@ -129,12 +172,34 @@ class EdgeEngine:
                 ecmwf_yes,
                 nws_adjusted,
                 hours_until_settlement,
+                buffer_score,
+                0.5,
+                None,
+                ladder_multiplier,
+                0.0,
             )
 
         model_probability = self._model_probability_for_side(gfs_yes, ecmwf_yes, side)
         edge = model_probability - ask_price
         confidence = self._confidence_for_side(gfs_yes, ecmwf_yes, side)
+        icon_yes = self._probability_yes(icon.member_temperatures_f, threshold, market_type) if icon else None
+        if icon_yes is not None:
+            icon_side = "yes" if icon_yes >= 0.5 else "no"
+            if icon_side != side:
+                confidence *= 0.7
+            else:
+                confidence = min(confidence * 1.15, 0.99)
         required_edge = self._required_edge(market)
+        if buffer_score == 0.1:
+            required_edge = max(required_edge, 0.20)
+        observation_score = self._observation_score(
+            current_temp_f,
+            threshold,
+            market_type,
+            side,
+            hours_until_settlement,
+        )
+        signal_score = self._combined_signal_score(buffer_score, observation_score, confidence, edge)
 
         if edge <= required_edge:
             return EdgeDecision(
@@ -152,6 +217,11 @@ class EdgeEngine:
                 ecmwf_yes,
                 nws_adjusted,
                 hours_until_settlement,
+                buffer_score,
+                observation_score,
+                icon_yes,
+                ladder_multiplier,
+                signal_score,
             )
         if confidence <= self.min_confidence:
             return EdgeDecision(
@@ -169,6 +239,33 @@ class EdgeEngine:
                 ecmwf_yes,
                 nws_adjusted,
                 hours_until_settlement,
+                buffer_score,
+                observation_score,
+                icon_yes,
+                ladder_multiplier,
+                signal_score,
+            )
+        if signal_score < 0.60:
+            return EdgeDecision(
+                False,
+                side,
+                ask_price,
+                self.limit_price(side, ask_price),
+                model_probability,
+                edge,
+                confidence,
+                f"Signal score {signal_score:.2f} is below 0.60 threshold.",
+                market_type,
+                threshold,
+                gfs_yes,
+                ecmwf_yes,
+                nws_adjusted,
+                hours_until_settlement,
+                buffer_score,
+                observation_score,
+                icon_yes,
+                ladder_multiplier,
+                signal_score,
             )
 
         return EdgeDecision(
@@ -186,6 +283,11 @@ class EdgeEngine:
             ecmwf_yes,
             nws_adjusted,
             hours_until_settlement,
+            buffer_score,
+            observation_score,
+            icon_yes,
+            ladder_multiplier,
+            signal_score,
         )
 
     def market_type(self, market: KalshiMarket) -> str:
@@ -233,6 +335,112 @@ class EdgeEngine:
         """Return a limit price one cent better than the current ask."""
         del side
         return round(max(0.01, ask_price - 0.01), 2)
+
+    def _temperature_buffer_score(
+        self,
+        nws_temp: float | None,
+        threshold: float,
+        market_type: str,
+        side: str
+    ) -> float:
+        """
+        Score 0.0-1.0 based on how far the forecast is from the threshold.
+        Larger buffer = higher score = more confident signal.
+        Buffer of 5F+ = 1.0 (near certain)
+        Buffer of 3-5F = 0.8 (strong)
+        Buffer of 1-3F = 0.5 (moderate)
+        Buffer of 0-1F = 0.1 (too close - noise erases edge)
+        """
+        if nws_temp is None:
+            return 0.5
+        if market_type == "high":
+            buffer = nws_temp - threshold if side == "yes" else threshold - nws_temp
+        else:
+            buffer = threshold - nws_temp if side == "yes" else nws_temp - threshold
+        if buffer >= 5.0:
+            return 1.0
+        if buffer >= 3.0:
+            return 0.8
+        if buffer >= 1.0:
+            return 0.5
+        if buffer >= 0.0:
+            return 0.1
+        return 0.0
+
+    def _observation_score(
+        self,
+        current_temp_f: float | None,
+        threshold: float,
+        market_type: str,
+        side: str,
+        hours_until_settlement: float | None
+    ) -> float:
+        """
+        Score based on current live temperature vs threshold.
+        Only meaningful when within 8 hours of settlement.
+        If already past threshold and settling in <4 hours = near certainty.
+        """
+        del side
+        if current_temp_f is None or hours_until_settlement is None or hours_until_settlement > 8:
+            return 0.5
+        if market_type == "high":
+            already_exceeded = current_temp_f >= threshold
+        else:
+            already_exceeded = current_temp_f <= threshold
+        if already_exceeded and hours_until_settlement < 4:
+            return 1.0
+        if already_exceeded and hours_until_settlement < 8:
+            return 0.9
+        buffer = abs(current_temp_f - threshold)
+        if buffer >= 5:
+            return 0.8
+        if buffer >= 2:
+            return 0.6
+        return 0.4
+
+    def calculate_ladder_sum(self, all_market_prices: list[float]) -> float:
+        """
+        Sum all YES ask prices for a city's temperature brackets.
+        Perfect market = 1.0. Under 0.92 = whole market underpriced.
+        Over 1.08 = whole market overpriced.
+        Returns a multiplier: underpriced -> increase position size
+        Overpriced -> decrease position size or skip
+        """
+        if not all_market_prices:
+            return 1.0
+        total = sum(all_market_prices)
+        if total < 0.92:
+            return 1.20
+        if total > 1.08:
+            return 0.80
+        return 1.00
+
+    def _check_liquidity(self, market: KalshiMarket) -> bool:
+        """
+        Only trade markets with meaningful liquidity.
+        Checks yes_ask_size_fp from raw market data.
+        Skip markets with less than 50 contracts available at ask.
+        """
+        yes_size = float(market.raw.get("yes_ask_size_fp", 0) or 0)
+        no_size = float(market.raw.get("no_ask_size_fp", 0) or 0)
+        min_size = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "50"))
+        return yes_size >= min_size or no_size >= min_size
+
+    def _combined_signal_score(
+        self,
+        buffer_score: float,
+        observation_score: float,
+        confidence: float,
+        edge: float,
+    ) -> float:
+        """Return the weighted combined signal score used before Claude."""
+        signal_score = (
+            buffer_score * 0.35 +
+            observation_score * 0.25 +
+            confidence * 0.25 +
+            (edge / 0.45) * 0.15
+        )
+        return round(min(signal_score, 1.0), 3)
 
     def _required_edge(self, market: KalshiMarket) -> float:
         """Return the market-specific minimum edge threshold."""
@@ -301,6 +509,7 @@ class EdgeEngine:
         ask_price: float | None = None,
         gfs_yes: float | None = None,
         ecmwf_yes: float | None = None,
+        ladder_multiplier: float = 1.0,
     ) -> EdgeDecision:
         """Build a detailed skip decision for early filters."""
         return EdgeDecision(
@@ -318,4 +527,9 @@ class EdgeEngine:
             ecmwf_yes,
             None,
             hours_until_settlement,
+            0.5,
+            0.5,
+            None,
+            ladder_multiplier,
+            0.5,
         )

@@ -80,6 +80,7 @@ class WeatherClient:
         self.model_names = {
             "gfs": os.getenv("OPEN_METEO_GFS_MODEL", "gfs_seamless"),
             "ecmwf": os.getenv("OPEN_METEO_ECMWF_MODEL", "ecmwf_ifs025"),
+            "icon": os.getenv("OPEN_METEO_ICON_MODEL", "icon_seamless"),
         }
 
     def watched_cities(self) -> list[CityConfig]:
