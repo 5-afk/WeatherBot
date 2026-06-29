@@ -17,6 +17,7 @@ class ClaudeDecision:
 
     decision: str
     reason: str
+    ticker: str | None = None
 
     @property
     def approved(self) -> bool:
@@ -97,6 +98,61 @@ class ClaudeChecker:
         except Exception as exc:
             logging.warning("Claude sanity check failed safe: %s", exc)
             return ClaudeDecision("NOGO", f"Claude API failed safe: {exc}")
+
+    def check_batch(
+        self,
+        candidates: list[dict[str, Any]],
+        balance: float | None = None,
+    ) -> ClaudeDecision:
+        """
+        Evaluate all candidates in one API call.
+        Claude picks the best one or rejects all.
+        """
+        if not self.api_key or self.api_key == "your_key_here":
+            return ClaudeDecision("NOGO", "API key not configured.")
+        if not candidates:
+            return ClaudeDecision("NOGO", "No candidates.")
+
+        try:
+            client = Anthropic(api_key=self.api_key)
+            payload = {
+                "account_balance_usd": balance,
+                "candidates": candidates,
+            }
+            message = client.messages.create(
+                model=self.model,
+                max_tokens=200,
+                system=(
+                    "You are a Kalshi weather trading risk checker. "
+                    "You receive a list of trade candidates that have already "
+                    "passed strict math filters. Pick the SINGLE best trade "
+                    "or reject all. Respond with ONLY raw JSON, no markdown: "
+                    "{\"decision\": \"GO\" or \"NOGO\", "
+                    "\"ticker\": \"the ticker you pick or null\", "
+                    "\"reason\": \"one sentence\"}. "
+                    "Approve only if: signal_score >= 0.75, large buffer, "
+                    "high confidence, no severe alerts. "
+                    "Reject all if any severe weather alert is active."
+                ),
+                messages=[{
+                    "role": "user",
+                    "content": json.dumps(payload, default=str),
+                }],
+            )
+            text = self._extract_text(message)
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+            parsed = json.loads(text)
+            decision = str(parsed.get("decision", "NOGO")).upper()
+            reason = str(parsed.get("reason", "No reason."))
+            ticker = parsed.get("ticker")
+            if decision not in {"GO", "NOGO"}:
+                return ClaudeDecision("NOGO", "Invalid decision.")
+            return ClaudeDecision(decision, reason, str(ticker) if ticker else None)
+        except Exception as exc:
+            logging.warning("Claude batch check failed: %s", exc)
+            return ClaudeDecision("NOGO", f"Claude failed safe: {exc}")
 
     def _extract_text(self, message: Any) -> str:
         """Extract the first non-empty text block from an Anthropic response."""

@@ -13,7 +13,6 @@ import colorlog
 import requests
 
 from src.claude_checker import ClaudeChecker, ClaudeDecision
-from src.data_enricher import DataEnricher
 from src.edge_engine import EdgeDecision, EdgeEngine
 from src.kalshi_client import KalshiClient, KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
@@ -87,7 +86,6 @@ class Trader:
         self.weather = WeatherClient()
         self.edge_engine = EdgeEngine()
         self.claude = ClaudeChecker()
-        self.enricher = DataEnricher()
         self.position_sizer = PositionSizer()
         self.risk = RiskManager(DATA_DIR / "positions.db")
         self._claude_calls_today = 0
@@ -102,203 +100,289 @@ class Trader:
         self._ensure_pnl_file()
 
     def run_full_pipeline(self) -> None:
-        """Run one full market scan and post a summary to Discord."""
-        self.last_scan_time = datetime.now(timezone.utc)
+        """Run one full scan: collect markets, evaluate math, call Claude once, trade."""
         if self.paused:
             logging.info("[CYCLE] Bot is paused — skipping scan.")
             return
 
+        self.last_scan_time = datetime.now(timezone.utc)
         logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Pipeline started. dry_run=%s", self.dry_run)
 
-        # Track scan stats
         self._scan_bets = 0
         self._scan_skips = 0
-        self._scan_signals = 0  # markets that passed math but failed Claude
+        self._scan_signals = 0
+        self._weather_cache: dict[tuple[str, str, str], tuple[EnsembleForecast, EnsembleForecast, EnsembleForecast, NwsForecast]] = {}
+        self._observation_cache: dict[str, float | None] = {}
 
-        for city in self.weather.watched_cities():
-            for series_ticker in (city.high_series, city.low_series):
-                self._scan_series(city, series_ticker)
-        self._maybe_record_day_end()
-        logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Pipeline finished.")
-
-        # Post scan summary to Discord
-        balance = self.kalshi.get_balance() if not self.dry_run else None
-        balance_str = f"${balance:.2f}" if balance else "n/a"
-        mode = "🧪 DRY RUN" if self.dry_run else "💰 LIVE"
-        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        next_scan = "in 30 min"
-
-        if self._scan_bets > 0:
-            summary = (
-                f"📊 Scan complete [{now}] | {mode}\n"
-                f"✅ Bets placed: {self._scan_bets}\n"
-                f"⏭️ Skipped: {self._scan_skips}\n"
-                f"💰 Balance: {balance_str}\n"
-                f"🕐 Next scan: {next_scan}"
-            )
-        else:
-            summary = (
-                f"📊 Scan complete [{now}] | {mode}\n"
-                f"🔍 No qualifying signals\n"
-                f"⏭️ Markets checked: {self._scan_skips}\n"
-                f"💰 Balance: {balance_str}\n"
-                f"🕐 Next scan: {next_scan}"
-            )
-        self._send_discord(summary)
-
-    def _scan_series(self, city: CityConfig, series_ticker: str) -> None:
-        """Fetch and process every open market in one city series."""
-        try:
-            markets = self.kalshi.list_markets(series_ticker)
-        except requests.RequestException as exc:
-            logging.error("[ERROR] %s | Kalshi fetch failed for %s: %s", city.short_code, series_ticker, exc)
-            self._scan_skips = getattr(self, "_scan_skips", 0) + 1
-            self._send_discord(f"BOT ERROR\nCity: {city.name}\nKalshi fetch failed: {exc}")
-            return
-
-        if not markets:
-            logging.info("[SKIP] %s | No open markets for %s", city.short_code, series_ticker)
-            self._scan_skips = getattr(self, "_scan_skips", 0) + 1
-            return
-
-        ladder_multiplier = self.edge_engine.calculate_ladder_sum(
-            [market.yes_ask for market in markets if market.yes_ask is not None]
-        )
-        for market in markets:
-            self._process_market(city, market, ladder_multiplier)
-
-    def _process_market(self, city: CityConfig, market: KalshiMarket, ladder_multiplier: float = 1.0) -> None:
-        """Handle a single market without letting failures stop the scan."""
-        try:
-            self._process_market_inner(city, market, ladder_multiplier)
-        except Exception as exc:
-            logging.exception("[ERROR] %s | Market %s failed: %s", city.short_code, market.ticker, exc)
-            self.risk.record_decision(
-                ticker=market.ticker,
-                city=city.name,
-                decision="ERROR",
-                reason=str(exc),
-                edge=None,
-                confidence=None,
-                market_price=None,
-            )
-            self._scan_skips = getattr(self, "_scan_skips", 0) + 1
-            self._send_discord(f"BOT ERROR\nMarket: {market.ticker}\nReason: {exc}")
-
-    def _process_market_inner(self, city: CityConfig, market: KalshiMarket, ladder_multiplier: float = 1.0) -> None:
-        """Run data fetches, filters, Claude, risk checks, and order handling."""
-        # Always verify real balance before processing any market
         if not self.dry_run:
             real_balance = self.kalshi.get_balance()
-            if real_balance is None:
-                logging.error("Could not fetch Kalshi balance — skipping scan for safety")
-                self._send_discord("⚠️ Could not verify Kalshi balance — scan skipped for safety")
+            if not real_balance or real_balance < 1.0:
+                logging.warning("Balance too low or unavailable — skipping scan")
+                self._send_discord("⚠️ Balance too low or unavailable — scan skipped for safety")
                 return
-            if real_balance < 1.0:
-                logging.warning("Kalshi balance too low: $%.2f — stopping bot", real_balance)
-                self._send_discord(f"⛔ Balance too low to trade: ${real_balance:.2f}")
-                self.paused = True
-                return
-            # Sync the real balance as today's budget
             self.risk._set_state("running_budget", str(real_balance))
-            logging.info("Balance verified: $%.2f", real_balance)
+            logging.info("Balance: $%.2f", real_balance)
+        else:
+            real_balance = None
 
+        today = datetime.now(timezone.utc).date()
+        if today != self._claude_call_date:
+            self._claude_calls_today = 0
+            self._claude_call_date = today
+        max_calls = int(os.getenv("MAX_CLAUDE_CALLS_PER_DAY", "5"))
+        if self._claude_calls_today >= max_calls:
+            logging.info("Daily Claude limit reached — math-only scan")
+
+        market_rows: list[tuple[CityConfig, KalshiMarket, float]] = []
+        for city in self.weather.watched_cities():
+            for series_ticker in (city.high_series, city.low_series):
+                try:
+                    markets = self.kalshi.list_markets(series_ticker)
+                except Exception as exc:
+                    logging.error("Fetch failed %s: %s", series_ticker, exc)
+                    continue
+                ladder_multiplier = self.edge_engine.calculate_ladder_sum(
+                    [market.yes_ask for market in markets if market.yes_ask is not None]
+                )
+                market_rows.extend((city, market, ladder_multiplier) for market in markets)
+
+        candidates: list[tuple[CityConfig, KalshiMarket, EdgeDecision]] = []
+        total_checked = 0
+        for city, market, ladder_multiplier in market_rows:
+            total_checked += 1
+            try:
+                result = self._math_evaluate(city, market, ladder_multiplier)
+                if result:
+                    candidates.append(result)
+                    logging.info(
+                        "[CANDIDATE] %s signal=%.2f edge=%.1f%%",
+                        market.ticker,
+                        result[2].signal_score,
+                        (result[2].edge or 0.0) * 100,
+                    )
+            except Exception as exc:
+                logging.error("Eval failed %s: %s", market.ticker, exc)
+
+        logging.info("[CYCLE] Checked %d markets, %d candidates", total_checked, len(candidates))
+        if not candidates:
+            logging.info("[CYCLE] No qualifying candidates — scan complete")
+            self._maybe_record_day_end()
+            self._send_scan_summary(real_balance, total_checked, 0)
+            return
+
+        candidates.sort(key=lambda item: item[2].signal_score, reverse=True)
+
+        if self._claude_calls_today >= max_calls:
+            best_city, best_market, best_edge = candidates[0]
+            logging.info("No Claude available — using top math signal")
+            self._execute_trade(
+                best_city,
+                best_market,
+                best_edge,
+                ClaudeDecision("GO", "Math-only: Claude limit reached"),
+                real_balance,
+            )
+            self._maybe_record_day_end()
+            self._send_scan_summary(real_balance, total_checked, len(candidates))
+            return
+
+        batch = [self._batch_candidate_payload(city, market, edge) for city, market, edge in candidates[:5]]
+        self._claude_calls_today += 1
+        logging.info(
+            "Claude batch call %d/%d — evaluating %d candidates",
+            self._claude_calls_today,
+            max_calls,
+            len(batch),
+        )
+        self._scan_signals = getattr(self, "_scan_signals", 0) + 1
+        claude_decision = self.claude.check_batch(batch, balance=real_balance)
+        logging.info("Claude decision=%s reason=%s", claude_decision.decision, claude_decision.reason)
+        if not claude_decision.approved:
+            logging.warning("[SKIP] Claude rejected all candidates: %s", claude_decision.reason)
+            self._maybe_record_day_end()
+            self._send_scan_summary(real_balance, total_checked, len(candidates))
+            return
+
+        best_city, best_market, best_edge = self._select_candidate(candidates, claude_decision.ticker)
+        self._execute_trade(best_city, best_market, best_edge, claude_decision, real_balance)
+        self._maybe_record_day_end()
+        self._send_scan_summary(real_balance, total_checked, len(candidates))
+
+    def _math_evaluate(
+        self,
+        city: CityConfig,
+        market: KalshiMarket,
+        ladder_multiplier: float = 1.0,
+    ) -> tuple[CityConfig, KalshiMarket, EdgeDecision] | None:
+        """Run numeric/weather evaluation only; never call Claude or place orders."""
         settlement_time = market.settlement_time or market.close_time
         if settlement_time is None:
             self._log_skip(city, market, "No settlement time available.", None)
-            return
+            return None
 
         market_type = self.edge_engine.market_type(market)
         target_date = settlement_time.astimezone(timezone.utc).date()
-
+        cache_key = (city.name, target_date.isoformat(), market_type)
         try:
-            gfs = self.weather.get_ensemble_forecast(city, "gfs", target_date, market_type)
-            ecmwf = self.weather.get_ensemble_forecast(city, "ecmwf", target_date, market_type)
-            icon = self.weather.get_ensemble_forecast(city, "icon", target_date, market_type)
-            nws = self.weather.get_nws_forecast(city, target_date, market_type)
-        except requests.RequestException as exc:
-            self._log_skip(city, market, f"Weather API fallback skip: {exc}", None)
-            return
+            if cache_key not in self._weather_cache:
+                self._weather_cache[cache_key] = (
+                    self.weather.get_ensemble_forecast(city, "gfs", target_date, market_type),
+                    self.weather.get_ensemble_forecast(city, "ecmwf", target_date, market_type),
+                    self.weather.get_ensemble_forecast(city, "icon", target_date, market_type),
+                    self.weather.get_nws_forecast(city, target_date, market_type),
+                )
+            gfs, ecmwf, icon, nws = self._weather_cache[cache_key]
+        except Exception as exc:
+            logging.debug("Weather fetch failed %s: %s", market.ticker, exc)
+            self._log_skip(city, market, f"Weather fetch failed: {exc}", None)
+            return None
 
-        enrichment = self.enricher.enrich(city, target_date.isoformat())
-        edge_decision = self.edge_engine.evaluate(
+        current_temp_f = self._current_temp_f(city)
+        edge = self.edge_engine.evaluate(
             market,
             gfs=gfs,
             ecmwf=ecmwf,
             nws=nws,
             icon=icon,
-            current_temp_f=enrichment.get("current_temp_f"),
+            current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
         )
-        if not edge_decision.should_trade:
-            if edge_decision.reason.startswith("Pre-Claude gate failed"):
-                logging.warning("[SKIP] %s", edge_decision.reason)
-            self._log_skip(city, market, edge_decision.reason, edge_decision)
-            return
-        pre_claude_reason = self.edge_engine.pre_claude_gate_failure(edge_decision)
-        if pre_claude_reason:
-            logging.warning("[SKIP] Pre-Claude gate failed: %s", pre_claude_reason)
-            self._log_skip(city, market, f"Pre-Claude gate failed: {pre_claude_reason}", edge_decision)
-            return
+        if not edge.should_trade:
+            if edge.reason.startswith("Pre-Claude gate failed"):
+                logging.warning("[SKIP] %s", edge.reason)
+            self._log_skip(city, market, edge.reason, edge)
+            return None
+        return city, market, edge
 
-        claude_payload = self._claude_payload(city, market, edge_decision, gfs, ecmwf, nws, enrichment)
-
+    def _execute_trade(
+        self,
+        city: CityConfig,
+        market: KalshiMarket,
+        edge: EdgeDecision,
+        claude: ClaudeDecision,
+        real_balance: float | None,
+    ) -> None:
+        """Size and place the bet after the single batch Claude decision."""
+        del real_balance
         current_budget = self.risk.get_todays_budget()
         if current_budget < 1.0:
-            self._log_skip(city, market, f"No budget remaining today (${current_budget:.2f})", edge_decision)
+            logging.warning("No budget remaining")
+            self._log_skip(city, market, f"No budget remaining today (${current_budget:.2f})", edge)
             return
 
         last_won, previous_payout = self.risk.last_trade_state()
         size = self.position_sizer.size_trade(
-            win_probability=edge_decision.model_probability or 0.0,
-            price=edge_decision.limit_price or edge_decision.ask_price or 0.0,
-            confidence=edge_decision.confidence,
+            win_probability=min(edge.model_probability or 0.99, 0.99),
+            price=edge.limit_price or edge.ask_price or 0.0,
+            confidence=edge.confidence,
             current_budget=current_budget,
-            ladder_multiplier=edge_decision.ladder_multiplier,
+            ladder_multiplier=edge.ladder_multiplier,
             previous_payout=previous_payout,
             last_trade_won=last_won,
         )
         if size.contracts < 1:
-            self._log_skip(city, market, size.reason, edge_decision)
-            return
-
-        claude_payload["proposed_stake"] = size.stake
-        # Pass real balance to Claude so it knows the stakes
-        real_balance = self.kalshi.get_balance() if not self.dry_run else None
-        today = datetime.now(timezone.utc).date()
-        if today != self._claude_call_date:
-            self._claude_calls_today = 0
-            self._claude_call_date = today
-
-        max_claude_calls = int(os.getenv("MAX_CLAUDE_CALLS_PER_DAY", "5"))
-        if self._claude_calls_today >= max_claude_calls:
-            logging.warning(
-                "Daily Claude call limit reached (%d) — skipping Claude check",
-                max_claude_calls
-            )
-            self._log_skip(city, market, f"Daily Claude limit ({max_claude_calls}) reached.", edge_decision)
-            return
-
-        self._claude_calls_today += 1
-        logging.info("Claude call %d/%d today", self._claude_calls_today, max_claude_calls)
-        self._scan_signals = getattr(self, "_scan_signals", 0) + 1
-        claude_decision = self.claude.check(claude_payload, balance=real_balance)
-        logging.info("Claude market=%s decision=%s reason=%s", market.ticker, claude_decision.decision, claude_decision.reason)
-        if not claude_decision.approved:
-            self._log_skip(city, market, f"Claude NOGO: {claude_decision.reason}", edge_decision)
+            logging.warning("[SKIP] Stake too small: %s", size.reason)
+            self._log_skip(city, market, size.reason, edge)
             return
 
         risk_check = self.risk.can_trade(market.ticker, size.stake)
         if not risk_check.allowed:
-            self._log_skip(city, market, risk_check.reason, edge_decision)
+            logging.warning("[SKIP] Risk check failed: %s", risk_check.reason)
+            self._log_skip(city, market, risk_check.reason, edge)
             if risk_check.alert:
                 self._send_risk_alert(risk_check.reason)
             return
 
         if self.dry_run:
-            self._dry_run_bet(city, market, edge_decision, claude_decision, size)
+            self._dry_run_bet(city, market, edge, claude, size)
         else:
-            self._live_bet(city, market, edge_decision, claude_decision, size)
+            self._live_bet(city, market, edge, claude, size)
+
+    def _batch_candidate_payload(
+        self,
+        city: CityConfig,
+        market: KalshiMarket,
+        edge: EdgeDecision,
+    ) -> dict[str, Any]:
+        """Build one candidate row for the single Claude batch call."""
+        settlement = market.settlement_time or market.close_time
+        return {
+            "ticker": market.ticker,
+            "city": city.name,
+            "side": edge.side,
+            "threshold_f": edge.threshold_f,
+            "market_price": edge.ask_price,
+            "edge_pct": round((edge.edge or 0.0) * 100, 1),
+            "signal_score": edge.signal_score,
+            "buffer_score": edge.buffer_score,
+            "observation_score": edge.observation_score,
+            "confidence": round(edge.confidence * 100, 1),
+            "gfs_probability": edge.gfs_probability_yes,
+            "ecmwf_probability": edge.ecmwf_probability_yes,
+            "icon_probability": edge.icon_probability_yes,
+            "hours_until_settlement": edge.hours_until_settlement,
+            "nws_adjusted_f": edge.nws_adjusted_temperature_f,
+            "settlement": settlement.isoformat() if settlement else None,
+        }
+
+    def _select_candidate(
+        self,
+        candidates: list[tuple[CityConfig, KalshiMarket, EdgeDecision]],
+        ticker: str | None,
+    ) -> tuple[CityConfig, KalshiMarket, EdgeDecision]:
+        """Use Claude's ticker choice when present; otherwise use top signal score."""
+        if ticker:
+            wanted = ticker.upper()
+            for candidate in candidates:
+                if candidate[1].ticker.upper() == wanted:
+                    return candidate
+            logging.warning("Claude selected unknown ticker %s — using top signal", ticker)
+        return candidates[0]
+
+    def _current_temp_f(self, city: CityConfig) -> float | None:
+        """Fetch latest station temperature from NWS and convert Celsius to Fahrenheit."""
+        if city.name in self._observation_cache:
+            return self._observation_cache[city.name]
+        observation = self.weather.latest_station_observation(city)
+        if not observation:
+            self._observation_cache[city.name] = None
+            return None
+        value = (
+            observation.get("properties", {})
+            .get("temperature", {})
+            .get("value")
+        )
+        try:
+            celsius = float(value)
+        except (TypeError, ValueError):
+            self._observation_cache[city.name] = None
+            return None
+        current_temp = round(celsius * 9 / 5 + 32, 2)
+        self._observation_cache[city.name] = current_temp
+        return current_temp
+
+    def _send_scan_summary(self, balance: float | None, total_checked: int, candidate_count: int) -> None:
+        """Post the end-of-scan summary to Discord."""
+        balance_str = f"${balance:.2f}" if balance else "n/a"
+        mode = "🧪 DRY RUN" if self.dry_run else "💰 LIVE"
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        if self._scan_bets > 0:
+            summary = (
+                f"📊 Scan complete [{now}] | {mode}\n"
+                f"✅ Bets placed: {self._scan_bets}\n"
+                f"🔎 Markets checked: {total_checked}\n"
+                f"🎯 Candidates: {candidate_count}\n"
+                f"💰 Balance: {balance_str}"
+            )
+        else:
+            summary = (
+                f"📊 Scan complete [{now}] | {mode}\n"
+                f"🔍 No bet placed\n"
+                f"🔎 Markets checked: {total_checked}\n"
+                f"🎯 Candidates: {candidate_count}\n"
+                f"💰 Balance: {balance_str}"
+            )
+        self._send_discord(summary)
 
     def _dry_run_bet(
         self,
