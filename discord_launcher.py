@@ -129,10 +129,22 @@ class BotLauncher:
                 )
 
         @self.bot.command(name="logs")
-        async def logs(ctx):
+        async def logs_cmd(ctx):
             """Show the last 20 lines of logs/bot.log."""
-            log_text = launcher._last_log_lines()
-            await ctx.send(f"📋 Last 20 log lines:\n{log_text}"[:1900])
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            try:
+                log_path = Path("logs/bot.log")
+                if not log_path.exists():
+                    await ctx.send("No log file found.")
+                    return
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+                last_20 = "\n".join(lines[-20:])
+                if len(last_20) > 1900:
+                    last_20 = last_20[-1900:]
+                await ctx.send(f"```\n{last_20}\n```")
+            except Exception as exc:
+                await ctx.send(f"Error reading logs: {exc}")
 
         @self.bot.command(name="balance")
         async def balance_cmd(ctx):
