@@ -200,6 +200,50 @@ class EdgeEngine:
             hours_until_settlement,
         )
         signal_score = self._combined_signal_score(buffer_score, observation_score, confidence, edge)
+        pre_claude_decision = EdgeDecision(
+            False,
+            side,
+            ask_price,
+            self.limit_price(side, ask_price),
+            model_probability,
+            edge,
+            confidence,
+            "",
+            market_type,
+            threshold,
+            gfs_yes,
+            ecmwf_yes,
+            nws_adjusted,
+            hours_until_settlement,
+            buffer_score,
+            observation_score,
+            icon_yes,
+            ladder_multiplier,
+            signal_score,
+        )
+        pre_claude_reason = self.pre_claude_gate_failure(pre_claude_decision)
+        if pre_claude_reason:
+            return EdgeDecision(
+                False,
+                side,
+                ask_price,
+                self.limit_price(side, ask_price),
+                model_probability,
+                edge,
+                confidence,
+                f"Pre-Claude gate failed: {pre_claude_reason}",
+                market_type,
+                threshold,
+                gfs_yes,
+                ecmwf_yes,
+                nws_adjusted,
+                hours_until_settlement,
+                buffer_score,
+                observation_score,
+                icon_yes,
+                ladder_multiplier,
+                signal_score,
+            )
 
         if edge <= required_edge:
             return EdgeDecision(
@@ -245,29 +289,6 @@ class EdgeEngine:
                 ladder_multiplier,
                 signal_score,
             )
-        if signal_score < 0.60:
-            return EdgeDecision(
-                False,
-                side,
-                ask_price,
-                self.limit_price(side, ask_price),
-                model_probability,
-                edge,
-                confidence,
-                f"Signal score {signal_score:.2f} is below 0.60 threshold.",
-                market_type,
-                threshold,
-                gfs_yes,
-                ecmwf_yes,
-                nws_adjusted,
-                hours_until_settlement,
-                buffer_score,
-                observation_score,
-                icon_yes,
-                ladder_multiplier,
-                signal_score,
-            )
-
         return EdgeDecision(
             True,
             side,
@@ -289,6 +310,23 @@ class EdgeEngine:
             ladder_multiplier,
             signal_score,
         )
+
+    def pre_claude_gate_failure(self, decision: EdgeDecision) -> str | None:
+        """Return a reason when the strict pre-Claude gate should block the trade."""
+        if decision.signal_score < 0.75:
+            return f"signal_score {decision.signal_score:.2f} < 0.75"
+        if decision.edge is None or decision.edge < 0.15:
+            edge_text = "n/a" if decision.edge is None else f"{decision.edge:.1%}"
+            return f"edge {edge_text} < 15.0%"
+        if decision.confidence < 0.80:
+            return f"confidence {decision.confidence:.1%} < 80.0%"
+        if decision.buffer_score < 0.50:
+            return f"buffer_score {decision.buffer_score:.2f} < 0.50"
+        if decision.hours_until_settlement is None:
+            return "hours_until_settlement unavailable"
+        if decision.hours_until_settlement > 20:
+            return f"hours_until_settlement {decision.hours_until_settlement:.1f} > 20"
+        return None
 
     def market_type(self, market: KalshiMarket) -> str:
         """Infer whether a market resolves on a daily high or low."""
@@ -348,7 +386,7 @@ class EdgeEngine:
         Larger buffer = higher score = more confident signal.
         Buffer of 5F+ = 1.0 (near certain)
         Buffer of 3-5F = 0.8 (strong)
-        Buffer of 1-3F = 0.5 (moderate)
+        Buffer of 1-3F = 0.3 (too close for the strict pre-Claude gate)
         Buffer of 0-1F = 0.1 (too close - noise erases edge)
         """
         if nws_temp is None:
@@ -362,7 +400,7 @@ class EdgeEngine:
         if buffer >= 3.0:
             return 0.8
         if buffer >= 1.0:
-            return 0.5
+            return 0.3
         if buffer >= 0.0:
             return 0.1
         return 0.0

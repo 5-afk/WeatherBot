@@ -90,6 +90,8 @@ class Trader:
         self.enricher = DataEnricher()
         self.position_sizer = PositionSizer()
         self.risk = RiskManager(DATA_DIR / "positions.db")
+        self._claude_calls_today = 0
+        self._claude_call_date = datetime.now(timezone.utc).date()
         # Always sync real balance from Kalshi on startup
         real_balance = self.kalshi.get_balance()
         if real_balance and real_balance > 0:
@@ -229,7 +231,14 @@ class Trader:
             ladder_multiplier=ladder_multiplier,
         )
         if not edge_decision.should_trade:
+            if edge_decision.reason.startswith("Pre-Claude gate failed"):
+                logging.warning("[SKIP] %s", edge_decision.reason)
             self._log_skip(city, market, edge_decision.reason, edge_decision)
+            return
+        pre_claude_reason = self.edge_engine.pre_claude_gate_failure(edge_decision)
+        if pre_claude_reason:
+            logging.warning("[SKIP] Pre-Claude gate failed: %s", pre_claude_reason)
+            self._log_skip(city, market, f"Pre-Claude gate failed: {pre_claude_reason}", edge_decision)
             return
 
         claude_payload = self._claude_payload(city, market, edge_decision, gfs, ecmwf, nws, enrichment)
@@ -256,6 +265,22 @@ class Trader:
         claude_payload["proposed_stake"] = size.stake
         # Pass real balance to Claude so it knows the stakes
         real_balance = self.kalshi.get_balance() if not self.dry_run else None
+        today = datetime.now(timezone.utc).date()
+        if today != self._claude_call_date:
+            self._claude_calls_today = 0
+            self._claude_call_date = today
+
+        max_claude_calls = int(os.getenv("MAX_CLAUDE_CALLS_PER_DAY", "5"))
+        if self._claude_calls_today >= max_claude_calls:
+            logging.warning(
+                "Daily Claude call limit reached (%d) — skipping Claude check",
+                max_claude_calls
+            )
+            self._log_skip(city, market, f"Daily Claude limit ({max_claude_calls}) reached.", edge_decision)
+            return
+
+        self._claude_calls_today += 1
+        logging.info("Claude call %d/%d today", self._claude_calls_today, max_claude_calls)
         self._scan_signals = getattr(self, "_scan_signals", 0) + 1
         claude_decision = self.claude.check(claude_payload, balance=real_balance)
         logging.info("Claude market=%s decision=%s reason=%s", market.ticker, claude_decision.decision, claude_decision.reason)
