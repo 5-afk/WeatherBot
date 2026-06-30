@@ -158,7 +158,7 @@ class BotLauncher:
 
         @self.bot.command(name="logs")
         async def logs_cmd(ctx):
-            """Show the last 20 lines of logs/bot.log."""
+            """Show last 30 lines as text."""
             if str(ctx.channel.id) != launcher.channel_id:
                 return
             try:
@@ -166,13 +166,77 @@ class BotLauncher:
                 if not log_path.exists():
                     await ctx.send("No log file found.")
                     return
-                lines = log_path.read_text(encoding="utf-8").splitlines()
-                last_20 = "\n".join(lines[-20:])
-                if len(last_20) > 1900:
-                    last_20 = last_20[-1900:]
-                await ctx.send(f"```\n{last_20}\n```")
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                last_30 = "\n".join(lines[-30:])
+                if len(last_30) > 1900:
+                    last_30 = last_30[-1900:]
+                await ctx.send(f"```\n{last_30}\n```")
             except Exception as exc:
                 await ctx.send(f"Error reading logs: {exc}")
+
+        @self.bot.command(name="logsfull")
+        async def logsfull_cmd(ctx):
+            """Upload the entire log file as a Discord attachment."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            try:
+                log_path = Path("logs/bot.log")
+                if not log_path.exists():
+                    await ctx.send("No log file found.")
+                    return
+                size_mb = log_path.stat().st_size / (1024 * 1024)
+                if size_mb > 8:
+                    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    trimmed = "\n".join(lines[-5000:])
+                    temp_path = Path("logs/bot_trimmed.log")
+                    temp_path.write_text(trimmed, encoding="utf-8")
+                    await ctx.send(
+                        f"Full log is {size_mb:.1f}MB (too large) — sending last 5000 lines instead:",
+                        file=discord.File(str(temp_path)),
+                    )
+                    temp_path.unlink(missing_ok=True)
+                else:
+                    await ctx.send(
+                        f"Full log file ({size_mb:.2f}MB):",
+                        file=discord.File(str(log_path)),
+                    )
+            except Exception as exc:
+                await ctx.send(f"Error sending log file: {exc}")
+
+        @self.bot.command(name="logssince")
+        async def logssince_cmd(ctx, hours: int = 24):
+            """Upload only log lines from the last N hours."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            try:
+                from datetime import timedelta
+
+                log_path = Path("logs/bot.log")
+                if not log_path.exists():
+                    await ctx.send("No log file found.")
+                    return
+                cutoff = datetime.now() - timedelta(hours=hours)
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                recent = []
+                for line in lines:
+                    try:
+                        ts_str = line[:19]
+                        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                        if ts >= cutoff:
+                            recent.append(line)
+                    except (ValueError, IndexError):
+                        if recent:
+                            recent.append(line)
+                content = "\n".join(recent)
+                temp_path = Path(f"logs/last_{hours}h.log")
+                temp_path.write_text(content, encoding="utf-8")
+                await ctx.send(
+                    f"Logs from last {hours} hours ({len(recent)} lines):",
+                    file=discord.File(str(temp_path)),
+                )
+                temp_path.unlink(missing_ok=True)
+            except Exception as exc:
+                await ctx.send(f"Error: {exc}")
 
         @self.bot.command(name="balance")
         async def balance_cmd(ctx):
@@ -198,7 +262,9 @@ class BotLauncher:
                 "!restart — restart the trading bot\n"
                 "!status  — check if bot is running\n"
                 "!balance — show real Kalshi account balance\n"
-                "!logs    — show last 20 log lines\n"
+                "!logs    — show last 30 log lines\n"
+                "!logsfull — upload full log file\n"
+                "!logssince [hours] — upload recent logs\n"
                 "!pocket  — show pocketed profits\n"
                 "!budget  — show compounding budget\n"
                 "!golive CONFIRM — switch to live trading\n"
