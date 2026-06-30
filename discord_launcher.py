@@ -109,13 +109,12 @@ class BotLauncher:
 
         @self.bot.command(name="stop")
         async def stop(ctx):
-            """Stop main.py if it is running."""
-            if not launcher._is_running():
-                await ctx.send("⚠️ KalshiBot is not running.")
-                return
-            await ctx.send("⏹️ Stopping KalshiBot...")
-            await launcher._stop_process()
-            await ctx.send("✅ KalshiBot stopped.")
+            """Stop main.py if running, then shut down the launcher cleanly."""
+            await ctx.send("⏹️ Stopping KalshiBot launcher...")
+            if launcher._is_running():
+                await launcher._stop_process()
+            await ctx.send("✅ KalshiBot launcher stopped.")
+            await launcher.bot.close()
 
         @self.bot.command(name="restart")
         async def restart(ctx):
