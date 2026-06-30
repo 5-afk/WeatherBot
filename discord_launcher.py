@@ -17,14 +17,15 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-sys.path.insert(0, os.getcwd())
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 from src.kalshi_client import KalshiClient
 
 
-load_dotenv()
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-PID_FILE = Path("bot.pid")
+PID_FILE = PROJECT_ROOT / "bot.pid"
 ET = zoneinfo.ZoneInfo("America/New_York")
 
 
@@ -175,7 +176,7 @@ class BotLauncher:
             if str(ctx.channel.id) != launcher.channel_id:
                 return
             try:
-                log_path = Path("logs/bot.log")
+                log_path = PROJECT_ROOT / "logs" / "bot.log"
                 if not log_path.exists():
                     await ctx.send("No log file found.")
                     return
@@ -193,7 +194,7 @@ class BotLauncher:
             if str(ctx.channel.id) != launcher.channel_id:
                 return
             try:
-                log_path = Path("logs/bot.log")
+                log_path = PROJECT_ROOT / "logs" / "bot.log"
                 if not log_path.exists():
                     await ctx.send("No log file found.")
                     return
@@ -201,7 +202,7 @@ class BotLauncher:
                 if size_mb > 8:
                     lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
                     trimmed = "\n".join(lines[-5000:])
-                    temp_path = Path("logs/bot_trimmed.log")
+                    temp_path = PROJECT_ROOT / "logs" / "bot_trimmed.log"
                     temp_path.write_text(trimmed, encoding="utf-8")
                     await ctx.send(
                         f"Full log is {size_mb:.1f}MB (too large) — sending last 5000 lines instead:",
@@ -224,7 +225,7 @@ class BotLauncher:
             try:
                 from datetime import timedelta
 
-                log_path = Path("logs/bot.log")
+                log_path = PROJECT_ROOT / "logs" / "bot.log"
                 if not log_path.exists():
                     await ctx.send("No log file found.")
                     return
@@ -241,7 +242,7 @@ class BotLauncher:
                         if recent:
                             recent.append(line)
                 content = "\n".join(recent)
-                temp_path = Path(f"logs/last_{hours}h.log")
+                temp_path = PROJECT_ROOT / "logs" / f"last_{hours}h.log"
                 temp_path.write_text(content, encoding="utf-8")
                 await ctx.send(
                     f"Logs from last {hours} hours ({len(recent)} lines):",
@@ -265,6 +266,26 @@ class BotLauncher:
             else:
                 await ctx.send("⚠️ Could not fetch balance")
 
+        @self.bot.command(name="ps")
+        async def ps_cmd(ctx):
+            """Show discord_launcher processes for remote diagnostics."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            try:
+                result = subprocess.run(
+                    "ps aux | grep discord_launcher",
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                output = result.stdout.strip() or result.stderr.strip() or "No output."
+                if len(output) > 1900:
+                    output = output[-1900:]
+                await ctx.send(f"```\n{output}\n```")
+            except Exception as exc:
+                await ctx.send(f"Error running ps: {exc}")
+
         @self.bot.command(name="help")
         async def help_command(ctx):
             """Show all launcher commands."""
@@ -278,6 +299,7 @@ class BotLauncher:
                 "!logs    — show last 30 log lines\n"
                 "!logsfull — upload full log file\n"
                 "!logssince [hours] — upload recent logs\n"
+                "!ps      — show launcher processes\n"
                 "!pocket  — show pocketed profits\n"
                 "!budget  — show compounding budget\n"
                 "!golive CONFIRM — switch to live trading\n"
@@ -344,7 +366,7 @@ class BotLauncher:
 
     def _start_process(self):
         """Start main.py as a subprocess."""
-        self.process = subprocess.Popen(["python", "main.py"], cwd=os.getcwd())
+        self.process = subprocess.Popen(["python", "main.py"], cwd=PROJECT_ROOT)
         self.start_time = datetime.now()
 
     async def _stop_process(self):
@@ -379,7 +401,7 @@ class BotLauncher:
 
     def _last_log_lines(self):
         """Read the last 20 lines from logs/bot.log."""
-        log_path = Path("logs") / "bot.log"
+        log_path = PROJECT_ROOT / "logs" / "bot.log"
         if not log_path.exists():
             return "No log file found."
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -387,7 +409,7 @@ class BotLauncher:
 
     def _last_scan_time(self):
         """Return the last scan timestamp seen in logs/bot.log."""
-        log_path = Path("logs") / "bot.log"
+        log_path = PROJECT_ROOT / "logs" / "bot.log"
         if not log_path.exists():
             return "Never"
         for line in reversed(log_path.read_text(encoding="utf-8", errors="replace").splitlines()):
@@ -429,7 +451,7 @@ class BotLauncher:
 
     def _risk_state_float(self, key, default):
         """Read a numeric value from the risk_state table."""
-        db_path = Path("data") / "positions.db"
+        db_path = PROJECT_ROOT / "data" / "positions.db"
         if not db_path.exists():
             return default
         try:
@@ -441,7 +463,7 @@ class BotLauncher:
 
     def _scalar(self, query, default):
         """Read one numeric aggregate from SQLite."""
-        db_path = Path("data") / "positions.db"
+        db_path = PROJECT_ROOT / "data" / "positions.db"
         if not db_path.exists():
             return default
         try:
@@ -453,7 +475,7 @@ class BotLauncher:
 
     def _budget_history(self):
         """Read recent budget compounding history rows."""
-        db_path = Path("data") / "positions.db"
+        db_path = PROJECT_ROOT / "data" / "positions.db"
         if not db_path.exists():
             return []
         try:
@@ -481,7 +503,7 @@ class BotLauncher:
 
     def _update_env(self, updates):
         """Update simple KEY=value pairs in the local .env file."""
-        env_path = Path(".env")
+        env_path = PROJECT_ROOT / ".env"
         lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
         seen = set()
         for index, line in enumerate(lines):
