@@ -285,6 +285,38 @@ class BotLauncher:
             except Exception as exc:
                 await ctx.send(f"Error running ps: {exc}")
 
+        @self.bot.command(name="gitstatus")
+        async def gitstatus_cmd(ctx):
+            """Show git status and latest commit for remote diagnostics."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            try:
+                status = subprocess.run(
+                    ["git", "status"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                latest = subprocess.run(
+                    ["git", "log", "-1", "--oneline"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                output = (
+                    "$ git status\n"
+                    f"{status.stdout or status.stderr}\n"
+                    "$ git log -1 --oneline\n"
+                    f"{latest.stdout or latest.stderr}"
+                ).strip()
+                if len(output) > 1900:
+                    output = output[-1900:]
+                await ctx.send(f"```\n{output}\n```")
+            except Exception as exc:
+                await ctx.send(f"Error running git status: {exc}")
+
         @self.bot.command(name="help")
         async def help_command(ctx):
             """Show all launcher commands."""
@@ -299,6 +331,7 @@ class BotLauncher:
                 "!logsfull — upload full log file\n"
                 "!logssince [hours] — upload recent logs\n"
                 "!ps      — show launcher processes\n"
+                "!gitstatus — show git status and latest commit\n"
                 "!pocket  — show pocketed profits\n"
                 "!budget  — show compounding budget\n"
                 "!golive CONFIRM — switch to live trading\n"
