@@ -75,6 +75,7 @@ class BotLauncher:
         async def on_ready():
             """Announce launcher startup and start the health check loop."""
             logging.info("Discord launcher connected as %s", launcher.bot.user)
+            logging.info("Registered Discord commands: %s", sorted(command.name for command in launcher.bot.commands))
             if not launcher.health_check.is_running():
                 launcher.health_check.start()
             await launcher._send_channel(
@@ -82,6 +83,18 @@ class BotLauncher:
                 "Type !help for commands.\n"
                 f"KalshiBot is currently: {launcher._status_label()}"
             )
+
+        @self.bot.event
+        async def on_command_error(ctx, error):
+            """Reply to command lookup failures in the configured channel."""
+            if not launcher._is_allowed_channel(ctx.channel.id):
+                return
+            if isinstance(error, commands.CommandNotFound):
+                await ctx.send(f"Unknown command. Try `!help`.")
+                return
+            if isinstance(error, commands.CheckFailure):
+                return
+            raise error
 
         @self.bot.command(name="start")
         async def start(ctx):
