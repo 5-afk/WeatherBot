@@ -39,6 +39,10 @@ class EdgeDecision:
 class EdgeEngine:
     """Apply the bot's price, timing, confidence, and forecast filters."""
 
+    MIN_SIGNAL_SCORE = 0.75
+    MIN_CONFIDENCE_FLOOR = 0.60
+    MAX_HOURS_UNTIL_SETTLEMENT = 24
+
     def __init__(self) -> None:
         """Read edge-engine thresholds from environment variables."""
         self.min_edge = float(os.getenv("MIN_EDGE", "0.10"))
@@ -84,27 +88,8 @@ class EdgeEngine:
         if gfs_yes is None or ecmwf_yes is None:
             return self._skip("No ensemble members matched the settlement date.", market_type, threshold, hours_until_settlement)
 
-        gfs_side = "yes" if gfs_yes >= 0.5 else "no"
-        ecmwf_side = "yes" if ecmwf_yes >= 0.5 else "no"
-        if gfs_side != ecmwf_side:
-            return EdgeDecision(
-                False,
-                None,
-                None,
-                None,
-                None,
-                None,
-                self._confidence_for_side(gfs_yes, ecmwf_yes, gfs_side),
-                f"GFS says {gfs_side.upper()} but ECMWF says {ecmwf_side.upper()}.",
-                market_type,
-                threshold,
-                gfs_yes,
-                ecmwf_yes,
-                self._adjust_nws_temperature(nws.temperature_f, market_type, settlement_time),
-                hours_until_settlement,
-            )
-
-        side = gfs_side
+        probability_yes = (gfs_yes + ecmwf_yes) / 2
+        side = "yes" if probability_yes >= 0.5 else "no"
         ask_price = market.yes_ask if side == "yes" else market.no_ask
         if ask_price is None:
             return self._skip(f"Missing {side.upper()} ask price.", market_type, threshold, hours_until_settlement)
@@ -199,7 +184,14 @@ class EdgeEngine:
             side,
             hours_until_settlement,
         )
-        signal_score = self._combined_signal_score(buffer_score, observation_score, confidence, edge)
+        model_agreement = 1 - abs(gfs_yes - ecmwf_yes)
+        signal_score = self._combined_signal_score(
+            buffer_score,
+            observation_score,
+            confidence,
+            edge,
+            model_agreement,
+        )
         pre_claude_decision = EdgeDecision(
             False,
             side,
@@ -267,28 +259,6 @@ class EdgeEngine:
                 ladder_multiplier,
                 signal_score,
             )
-        if confidence <= self.min_confidence:
-            return EdgeDecision(
-                False,
-                side,
-                ask_price,
-                self.limit_price(side, ask_price),
-                model_probability,
-                edge,
-                confidence,
-                f"Confidence {confidence:.1%} is below 70% threshold.",
-                market_type,
-                threshold,
-                gfs_yes,
-                ecmwf_yes,
-                nws_adjusted,
-                hours_until_settlement,
-                buffer_score,
-                observation_score,
-                icon_yes,
-                ladder_multiplier,
-                signal_score,
-            )
         return EdgeDecision(
             True,
             side,
@@ -313,19 +283,19 @@ class EdgeEngine:
 
     def pre_claude_gate_failure(self, decision: EdgeDecision) -> str | None:
         """Return a reason when the strict pre-Claude gate should block the trade."""
-        if decision.signal_score < 0.75:
-            return f"signal_score {decision.signal_score:.2f} < 0.75"
+        if decision.signal_score < self.MIN_SIGNAL_SCORE:
+            return f"signal_score {decision.signal_score:.2f} < {self.MIN_SIGNAL_SCORE}"
         if decision.edge is None or decision.edge < 0.15:
             edge_text = "n/a" if decision.edge is None else f"{decision.edge:.1%}"
             return f"edge {edge_text} < 15.0%"
-        if decision.confidence < 0.80:
-            return f"confidence {decision.confidence:.1%} < 80.0%"
+        if decision.confidence < self.MIN_CONFIDENCE_FLOOR:
+            return f"confidence {decision.confidence:.2f} below sanity floor {self.MIN_CONFIDENCE_FLOOR}"
         if decision.buffer_score < 0.50:
             return f"buffer_score {decision.buffer_score:.2f} < 0.50"
         if decision.hours_until_settlement is None:
             return "hours_until_settlement unavailable"
-        if decision.hours_until_settlement > 20:
-            return f"hours_until_settlement {decision.hours_until_settlement:.1f} > 20"
+        if decision.hours_until_settlement > self.MAX_HOURS_UNTIL_SETTLEMENT:
+            return f"hours_until_settlement {decision.hours_until_settlement:.1f} > {self.MAX_HOURS_UNTIL_SETTLEMENT}"
         return None
 
     def market_type(self, market: KalshiMarket) -> str:
@@ -470,12 +440,14 @@ class EdgeEngine:
         observation_score: float,
         confidence: float,
         edge: float,
+        model_agreement: float,
     ) -> float:
         """Return the weighted combined signal score used before Claude."""
         signal_score = (
-            buffer_score * 0.35 +
-            observation_score * 0.25 +
-            confidence * 0.25 +
+            model_agreement * 0.25 +
+            buffer_score * 0.25 +
+            observation_score * 0.20 +
+            confidence * 0.15 +
             (edge / 0.45) * 0.15
         )
         return round(min(signal_score, 1.0), 3)
