@@ -124,7 +124,7 @@ class Trader:
                 self._send_discord(f"⛔ Balance too low: ${real_balance:.2f}")
                 return
             self.risk._set_state("running_budget", str(real_balance))
-            logging.info("Balance: $%.2f", real_balance)
+            logging.info("Balance: $%.2f | running_budget synced from Kalshi", real_balance)
         else:
             real_balance = None
 

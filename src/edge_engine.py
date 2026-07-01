@@ -46,7 +46,7 @@ class EdgeEngine:
     def __init__(self) -> None:
         """Read edge-engine thresholds from environment variables."""
         self.min_edge = float(os.getenv("MIN_EDGE", "0.10"))
-        self.min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.70"))
+        self.min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.60"))
         self.min_price = float(os.getenv("MIN_CONTRACT_PRICE", "0.30"))
         self.max_price = float(os.getenv("MAX_CONTRACT_PRICE", "0.85"))
         self.denver_min_edge = float(os.getenv("DENVER_MIN_EDGE", "0.15"))
@@ -427,11 +427,11 @@ class EdgeEngine:
         """
         Only trade markets with meaningful liquidity.
         Checks yes_ask_size_fp from raw market data.
-        Skip markets with less than 50 contracts available at ask.
+        Skip markets with less than 20 contracts available at ask.
         """
         yes_size = float(market.raw.get("yes_ask_size_fp", 0) or 0)
         no_size = float(market.raw.get("no_ask_size_fp", 0) or 0)
-        min_size = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "50"))
+        min_size = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "20"))
         return yes_size >= min_size or no_size >= min_size
 
     def _combined_signal_score(
