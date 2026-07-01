@@ -82,6 +82,11 @@ class WeatherClient:
             "ecmwf": os.getenv("OPEN_METEO_ECMWF_MODEL", "ecmwf_ifs025"),
             "icon": os.getenv("OPEN_METEO_ICON_MODEL", "icon_seamless"),
         }
+        self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
+        self.expected_members = {
+            "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
+            "ecmwf": int(os.getenv("EXPECTED_ECMWF_MEMBERS", "51")),
+        }
 
     def watched_cities(self) -> list[CityConfig]:
         """Return the exact city list requested for scanning."""
@@ -119,43 +124,69 @@ class WeatherClient:
             "forecast_days": 3,
             "models": model_name,
         }
-        response = self.session.get(self.OPEN_METEO_ENSEMBLE_URL, params=params, timeout=self.timeout_seconds)
-        response.raise_for_status()
-        payload = response.json()
-        hourly = payload.get("hourly", {})
-        times = hourly.get("time", [])
-        member_series = self._extract_temperature_members(hourly)
+        try:
+            response = self.session.get(self.OPEN_METEO_ENSEMBLE_URL, params=params, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            payload = response.json()
+            hourly = payload.get("hourly", {})
+            times = hourly.get("time", [])
+            member_series = self._extract_temperature_members(hourly)
 
-        daily_values = []
-        for values in member_series:
-            daily_value = self._daily_high_or_low(times, values, target_date, market_type)
-            if daily_value is not None:
-                daily_values.append(daily_value)
+            daily_values = []
+            for values in member_series:
+                daily_value = self._daily_high_or_low(times, values, target_date, market_type)
+                if daily_value is not None:
+                    daily_values.append(daily_value)
 
-        expected = round(sum(daily_values) / len(daily_values), 2) if daily_values else None
-        return EnsembleForecast(model_name, daily_values, expected, len(daily_values))
+            member_count = len(daily_values)
+            expected = self.expected_members.get(model_key)
+            if expected is not None and member_count < expected:
+                logging.warning(
+                    "%s returned %d members for %s, expected %d.",
+                    model_key.upper(),
+                    member_count,
+                    city.name,
+                    expected,
+                )
+
+            mean_temp = round(sum(daily_values) / member_count, 2) if daily_values else None
+            return EnsembleForecast(model_name, daily_values, mean_temp, member_count)
+        except requests.RequestException as exc:
+            logging.warning("Ensemble forecast failed for %s %s: %s", city.name, model_key, exc)
+            return EnsembleForecast(model_name, [], None, 0)
 
     def get_nws_forecast(self, city: CityConfig, target_date: date, market_type: str) -> NwsForecast:
         """Fetch the official NWS point forecast for the settlement station area."""
         headers = {"User-Agent": self.nws_user_agent, "Accept": "application/geo+json"}
-        point_url = f"{self.NWS_BASE_URL}/points/{city.lat:.4f},{city.lon:.4f}"
-        point_response = self.session.get(point_url, headers=headers, timeout=self.timeout_seconds)
-        point_response.raise_for_status()
-        forecast_url = point_response.json()["properties"]["forecast"]
+        try:
+            point_url = f"{self.NWS_BASE_URL}/points/{city.lat:.4f},{city.lon:.4f}"
+            point_response = self.session.get(point_url, headers=headers, timeout=self.timeout_seconds)
+            point_response.raise_for_status()
+            forecast_url = point_response.json()["properties"]["forecast"]
 
-        forecast_response = self.session.get(forecast_url, headers=headers, timeout=self.timeout_seconds)
-        forecast_response.raise_for_status()
-        periods = forecast_response.json()["properties"].get("periods", [])
-        period = self._select_nws_period(periods, target_date, market_type)
-        if not period:
-            return NwsForecast(None, "No matching NWS forecast period", city.nws_station)
+            forecast_response = self.session.get(forecast_url, headers=headers, timeout=self.timeout_seconds)
+            forecast_response.raise_for_status()
+            periods = forecast_response.json()["properties"].get("periods", [])
+            period = self._select_nws_period(periods, target_date, market_type)
+            if not period:
+                return NwsForecast(None, "No matching NWS forecast period", city.nws_station)
 
-        temperature = self._safe_float(period.get("temperature"))
-        return NwsForecast(
-            temperature,
-            str(period.get("shortForecast", "")),
-            f"{city.nws_station} via NWS point forecast",
-        )
+            temperature = self._safe_float(period.get("temperature"))
+            if (
+                temperature is not None
+                and market_type == "high"
+                and target_date.month in {6, 7, 8}
+            ):
+                temperature = round(temperature - self.nws_warm_bias_f, 2)
+
+            return NwsForecast(
+                temperature,
+                str(period.get("shortForecast", "")),
+                f"{city.nws_station} via NWS point forecast",
+            )
+        except requests.RequestException as exc:
+            logging.warning("NWS forecast failed for %s: %s", city.nws_station, exc)
+            return NwsForecast(None, "NWS fetch failed", city.nws_station)
 
     def latest_station_observation(self, city: CityConfig) -> dict[str, Any] | None:
         """Fetch the latest station observation for debugging and audit logs."""

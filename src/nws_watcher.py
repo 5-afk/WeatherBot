@@ -85,8 +85,7 @@ class NWSWatcher:
                     self._run_backup(current_interval)
                 time.sleep(1)
             except KeyboardInterrupt:
-                logging.info("NWS watcher stopped by user.")
-                break
+                raise
             except Exception as exc:
                 logging.error("NWS watcher error (restarting in 30s): %s", exc)
                 time.sleep(30)

@@ -492,13 +492,8 @@ class EdgeEngine:
         market_type: str,
         settlement_time: datetime | None,
     ) -> float | None:
-        """Apply the 1.5°F warm-bias correction to NWS summer highs."""
-        if temperature_f is None:
-            return None
-        if settlement_time is None or market_type != "high":
-            return temperature_f
-        if settlement_time.month in {6, 7, 8}:
-            return round(temperature_f - self.nws_warm_bias_f, 2)
+        """Return NWS temperature; warm-bias correction is applied in WeatherClient.get_nws_forecast."""
+        del market_type, settlement_time
         return temperature_f
 
     def _nws_agrees(self, temperature_f: float | None, threshold: float, market_type: str, side: str) -> bool:
