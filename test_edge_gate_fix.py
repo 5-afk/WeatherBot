@@ -35,6 +35,7 @@ def test_mia_style_gate_passes() -> None:
         icon_probability_yes=1.0,
         ladder_multiplier=1.0,
         signal_score=0.88,
+        ev=0.40,
     )
     assert engine.pre_claude_gate_failure(decision) is None
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
@@ -87,6 +88,8 @@ class WeatherClient:
             "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
             "ecmwf": int(os.getenv("EXPECTED_ECMWF_MEMBERS", "51")),
         }
+        self._cache: dict[tuple[str, str, str, str], tuple[EnsembleForecast, datetime]] = {}
+        self._cache_ttl = timedelta(minutes=10)
 
     def watched_cities(self) -> list[CityConfig]:
         """Return the exact city list requested for scanning."""
@@ -116,6 +119,13 @@ class WeatherClient:
     ) -> EnsembleForecast:
         """Fetch a GFS or ECMWF ensemble and reduce members to daily highs/lows."""
         model_name = self.model_names[model_key]
+        cache_key = (city.name, model_key, str(target_date), market_type)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            result, expires_at = cached
+            if datetime.now() < expires_at:
+                return result
+
         params = {
             "latitude": city.lat,
             "longitude": city.lon,
@@ -124,36 +134,76 @@ class WeatherClient:
             "forecast_days": 3,
             "models": model_name,
         }
-        try:
-            response = self.session.get(self.OPEN_METEO_ENSEMBLE_URL, params=params, timeout=self.timeout_seconds)
-            response.raise_for_status()
-            payload = response.json()
-            hourly = payload.get("hourly", {})
-            times = hourly.get("time", [])
-            member_series = self._extract_temperature_members(hourly)
-
-            daily_values = []
-            for values in member_series:
-                daily_value = self._daily_high_or_low(times, values, target_date, market_type)
-                if daily_value is not None:
-                    daily_values.append(daily_value)
-
-            member_count = len(daily_values)
-            expected = self.expected_members.get(model_key)
-            if expected is not None and member_count < expected:
-                logging.warning(
-                    "%s returned %d members for %s, expected %d.",
-                    model_key.upper(),
-                    member_count,
-                    city.name,
-                    expected,
+        empty = EnsembleForecast(model_name, [], None, 0)
+        for attempt in range(3):
+            try:
+                response = self.session.get(
+                    self.OPEN_METEO_ENSEMBLE_URL,
+                    params=params,
+                    timeout=30,
                 )
+                if response.status_code == 429:
+                    wait = 2**attempt * 5
+                    logging.warning("Open-Meteo rate limited, waiting %ds", wait)
+                    time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                result = self._parse_ensemble_payload(
+                    response.json(),
+                    model_name=model_name,
+                    model_key=model_key,
+                    target_date=target_date,
+                    market_type=market_type,
+                    city=city,
+                )
+                self._cache[cache_key] = (result, datetime.now() + self._cache_ttl)
+                return result
+            except Exception as exc:
+                if attempt == 2:
+                    logging.warning(
+                        "Ensemble forecast failed for %s %s: %s",
+                        city.name,
+                        model_key,
+                        exc,
+                    )
+                    return empty
+                time.sleep(2**attempt)
+        return empty
 
-            mean_temp = round(sum(daily_values) / member_count, 2) if daily_values else None
-            return EnsembleForecast(model_name, daily_values, mean_temp, member_count)
-        except requests.RequestException as exc:
-            logging.warning("Ensemble forecast failed for %s %s: %s", city.name, model_key, exc)
-            return EnsembleForecast(model_name, [], None, 0)
+    def _parse_ensemble_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        model_name: str,
+        model_key: str,
+        target_date: date,
+        market_type: str,
+        city: CityConfig,
+    ) -> EnsembleForecast:
+        """Parse Open-Meteo ensemble JSON into daily member highs/lows."""
+        hourly = payload.get("hourly", {})
+        times = hourly.get("time", [])
+        member_series = self._extract_temperature_members(hourly)
+
+        daily_values = []
+        for values in member_series:
+            daily_value = self._daily_high_or_low(times, values, target_date, market_type)
+            if daily_value is not None:
+                daily_values.append(daily_value)
+
+        member_count = len(daily_values)
+        expected = self.expected_members.get(model_key)
+        if expected is not None and member_count < expected:
+            logging.warning(
+                "%s returned %d members for %s, expected %d.",
+                model_key.upper(),
+                member_count,
+                city.name,
+                expected,
+            )
+
+        mean_temp = round(sum(daily_values) / member_count, 2) if daily_values else None
+        return EnsembleForecast(model_name, daily_values, mean_temp, member_count)
 
     def get_nws_forecast(self, city: CityConfig, target_date: date, market_type: str) -> NwsForecast:
         """Fetch the official NWS point forecast for the settlement station area."""

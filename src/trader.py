@@ -12,6 +12,7 @@ from typing import Any
 import colorlog
 import requests
 
+from src.bot_control import is_paused
 from src.claude_checker import ClaudeChecker, ClaudeDecision
 from src.edge_engine import EdgeDecision, EdgeEngine
 from src.kalshi_client import KalshiClient, KalshiMarket
@@ -101,6 +102,7 @@ class Trader:
 
     def run_full_pipeline(self) -> None:
         """Run one full scan: collect markets, evaluate math, call Claude once, trade."""
+        self.paused = is_paused()
         if self.paused:
             logging.info("[CYCLE] Bot is paused — skipping scan.")
             return
@@ -158,10 +160,11 @@ class Trader:
                 if result:
                     candidates.append(result)
                     logging.info(
-                        "[CANDIDATE] %s signal=%.2f edge=%.1f%%",
+                        "[CANDIDATE] %s signal=%.2f edge=%.1f%% ev=%.4f",
                         market.ticker,
                         result[2].signal_score,
                         (result[2].edge or 0.0) * 100,
+                        result[2].ev or 0.0,
                     )
             except Exception as exc:
                 logging.error("Eval failed %s: %s", market.ticker, exc)
@@ -316,6 +319,7 @@ class Trader:
             "threshold_f": edge.threshold_f,
             "market_price": edge.ask_price,
             "edge_pct": round((edge.edge or 0.0) * 100, 1),
+            "expected_value_per_contract": edge.ev,
             "signal_score": edge.signal_score,
             "buffer_score": edge.buffer_score,
             "observation_score": edge.observation_score,
@@ -398,10 +402,11 @@ class Trader:
         """Record a simulated bet without calling Kalshi's order endpoint."""
         logging.getLogger().log(
             BET_LEVEL,
-            "[DRY RUN] %s %.0fF | Edge: %.1f%% | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Claude: %s",
+            "[DRY RUN] %s %.0fF | Edge: %.1f%% | EV: %.4f | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Claude: %s",
             city.short_code,
             edge.threshold_f or 0.0,
             (edge.edge or 0.0) * 100,
+            edge.ev or 0.0,
             edge.signal_score,
             self._buffer_text(edge),
             size.stake,
@@ -459,10 +464,11 @@ class Trader:
         order_id = str(response.get("order", {}).get("order_id") or response.get("order_id") or "")
         logging.getLogger().log(
             BET_LEVEL,
-            "[BET] %s %.0fF | Edge: %.1f%% | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Kelly: $%.2f | Claude: GO -- %s",
+            "[BET] %s %.0fF | Edge: %.1f%% | EV: %.4f | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Kelly: $%.2f | Claude: GO -- %s",
             city.short_code,
             edge.threshold_f or 0.0,
             (edge.edge or 0.0) * 100,
+            edge.ev or 0.0,
             edge.signal_score,
             self._buffer_text(edge),
             size.stake,
@@ -506,10 +512,11 @@ class Trader:
         market_price = edge.ask_price if edge else market.yes_ask
         edge_value = edge.edge if edge else None
         logging.warning(
-            "[SKIP] %s %s | Edge: %s | Signal: %.2f | Buffer: %s | Market: %s | Reason: %s",
+            "[SKIP] %s %s | Edge: %s | EV: %s | Signal: %.2f | Buffer: %s | Market: %s | Reason: %s",
             city.short_code,
             f"{threshold:.0f}F" if threshold is not None else "n/a",
             f"{edge_value:.1%}" if edge_value is not None else "n/a",
+            f"{edge.ev:.4f}" if edge and edge.ev is not None else "n/a",
             edge.signal_score if edge else 0.5,
             self._buffer_text(edge),
             f"${market_price:.2f}" if market_price is not None else "n/a",
@@ -560,6 +567,7 @@ class Trader:
             "market_price": edge.ask_price,
             "limit_price": edge.limit_price,
             "edge_percentage": None if edge.edge is None else round(edge.edge * 100, 2),
+            "expected_value_per_contract": edge.ev,
             "confidence_score": round(edge.confidence * 100, 2),
             "hours_until_settlement": edge.hours_until_settlement,
             "active_weather_alerts": enrichment.get("active_alerts", []),
@@ -648,6 +656,7 @@ class Trader:
             f"City: {city.name}\n"
             f"Bet: {(edge.side or '').upper()} ${size.stake:.2f} @ ${edge.limit_price:.2f}\n"
             f"Edge: {(edge.edge or 0.0):.1%}\n"
+            f"EV: {(edge.ev or 0.0):.4f}/contract\n"
             f"Confidence: {edge.confidence:.1%}\n"
             f"Contracts: {size.contracts}\n"
             f"Profit if win: ${size.contracts * (1 - (edge.limit_price or 0)):.2f}\n"

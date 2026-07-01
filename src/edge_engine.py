@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ class EdgeDecision:
     icon_probability_yes: float | None = None
     ladder_multiplier: float = 1.0
     signal_score: float = 0.5
+    ev: float | None = None
 
 
 class EdgeEngine:
@@ -47,8 +49,7 @@ class EdgeEngine:
         """Read edge-engine thresholds from environment variables."""
         self.min_edge = float(os.getenv("MIN_EDGE", "0.10"))
         self.min_confidence = float(os.getenv("MIN_CONFIDENCE", "0.60"))
-        self.min_price = float(os.getenv("MIN_CONTRACT_PRICE", "0.30"))
-        self.max_price = float(os.getenv("MAX_CONTRACT_PRICE", "0.85"))
+        self.min_ev_per_contract = float(os.getenv("MIN_EV_PER_CONTRACT", "0.05"))
         self.denver_min_edge = float(os.getenv("DENVER_MIN_EDGE", "0.15"))
         self.settlement_window_hours = float(os.getenv("SETTLEMENT_WINDOW_HOURS", "24"))
         self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
@@ -56,6 +57,7 @@ class EdgeEngine:
             "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
             "ecmwf": int(os.getenv("EXPECTED_ECMWF_MEMBERS", "51")),
         }
+        logging.info("EdgeEngine MIN_EV_PER_CONTRACT=%.4f", self.min_ev_per_contract)
 
     def evaluate(
         self,
@@ -93,9 +95,9 @@ class EdgeEngine:
         ask_price = market.yes_ask if side == "yes" else market.no_ask
         if ask_price is None:
             return self._skip(f"Missing {side.upper()} ask price.", market_type, threshold, hours_until_settlement)
-        if not self.min_price <= ask_price <= self.max_price:
+        if ask_price < 0.02 or ask_price > 0.98:
             return self._skip(
-                f"Market price ${ask_price:.2f} is outside ${self.min_price:.2f}-${self.max_price:.2f}.",
+                f"Market price ${ask_price:.2f} is essentially settled",
                 market_type,
                 threshold,
                 hours_until_settlement,
@@ -165,6 +167,19 @@ class EdgeEngine:
             )
 
         model_probability = self._model_probability_for_side(gfs_yes, ecmwf_yes, side)
+        ev = self._calculate_ev(model_probability, ask_price)
+        if ev < self.min_ev_per_contract:
+            return self._skip(
+                f"EV {ev:.4f} below threshold {self.min_ev_per_contract:.4f}",
+                market_type,
+                threshold,
+                hours_until_settlement,
+                side=side,
+                ask_price=ask_price,
+                gfs_yes=gfs_yes,
+                ecmwf_yes=ecmwf_yes,
+                ev=ev,
+            )
         edge = model_probability - ask_price
         confidence = self._confidence_for_side(gfs_yes, ecmwf_yes, side)
         icon_yes = self._probability_yes(icon.member_temperatures_f, threshold, market_type) if icon else None
@@ -189,7 +204,7 @@ class EdgeEngine:
             buffer_score,
             observation_score,
             confidence,
-            edge,
+            ev,
             model_agreement,
         )
         pre_claude_decision = EdgeDecision(
@@ -212,6 +227,7 @@ class EdgeEngine:
             icon_yes,
             ladder_multiplier,
             signal_score,
+            ev,
         )
         pre_claude_reason = self.pre_claude_gate_failure(pre_claude_decision)
         if pre_claude_reason:
@@ -235,6 +251,7 @@ class EdgeEngine:
                 icon_yes,
                 ladder_multiplier,
                 signal_score,
+                ev,
             )
 
         if edge <= required_edge:
@@ -258,6 +275,7 @@ class EdgeEngine:
                 icon_yes,
                 ladder_multiplier,
                 signal_score,
+                ev,
             )
         return EdgeDecision(
             True,
@@ -279,6 +297,7 @@ class EdgeEngine:
             icon_yes,
             ladder_multiplier,
             signal_score,
+            ev,
         )
 
     def pre_claude_gate_failure(self, decision: EdgeDecision) -> str | None:
@@ -434,21 +453,40 @@ class EdgeEngine:
         min_size = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "20"))
         return yes_size >= min_size or no_size >= min_size
 
+    def _calculate_ev(
+        self,
+        model_probability: float,
+        market_price: float,
+    ) -> float:
+        """
+        Calculate expected value per dollar staked.
+        model_probability: our forecast probability of the proposed side winning
+        market_price: current ask price for that side (0.0-1.0)
+        Returns EV per contract (positive = profitable)
+        """
+        if not 0 < market_price < 1:
+            return -999.0
+        profit_if_win = 1.0 - market_price
+        loss_if_lose = market_price
+        ev = (model_probability * profit_if_win) - ((1 - model_probability) * loss_if_lose)
+        return round(ev, 4)
+
     def _combined_signal_score(
         self,
         buffer_score: float,
         observation_score: float,
         confidence: float,
-        edge: float,
+        ev: float,
         model_agreement: float,
     ) -> float:
         """Return the weighted combined signal score used before Claude."""
+        ev_score = min(1.0, max(0.0, ev / 0.20))
         signal_score = (
-            model_agreement * 0.25 +
-            buffer_score * 0.25 +
+            buffer_score * 0.30 +
             observation_score * 0.20 +
-            confidence * 0.15 +
-            (edge / 0.45) * 0.15
+            confidence * 0.20 +
+            model_agreement * 0.15 +
+            ev_score * 0.15
         )
         return round(min(signal_score, 1.0), 3)
 
@@ -515,6 +553,7 @@ class EdgeEngine:
         gfs_yes: float | None = None,
         ecmwf_yes: float | None = None,
         ladder_multiplier: float = 1.0,
+        ev: float | None = None,
     ) -> EdgeDecision:
         """Build a detailed skip decision for early filters."""
         return EdgeDecision(
@@ -537,4 +576,5 @@ class EdgeEngine:
             None,
             ladder_multiplier,
             0.5,
+            ev,
         )

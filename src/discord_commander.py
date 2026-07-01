@@ -1,5 +1,8 @@
 """Two-way Discord control panel for the Kalshi weather bot."""
 
+# This module is deprecated — all Discord commands are handled by discord_launcher.py
+# Do not instantiate DiscordCommander — it will conflict with the launcher bot
+
 from __future__ import annotations
 
 import logging
@@ -32,12 +35,10 @@ class DiscordCommander:
         thread.start()
 
     def _run(self) -> None:
-        """Run the Discord bot using the configured bot token."""
-        token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-        if not token or token == "your_token_here":
-            logging.warning("Discord token not configured — commander disabled.")
-            return
-        self.bot.run(token)
+        """Deprecated — do not start a second Discord bot."""
+        logging.error(
+            "DiscordCommander is deprecated. Use discord_launcher.py for all Discord commands."
+        )
 
     def _register_events(self) -> None:
         """Register Discord lifecycle and message filter events."""

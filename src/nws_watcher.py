@@ -12,6 +12,8 @@ import zoneinfo
 
 import schedule
 
+from src.bot_control import consume_scan_trigger
+
 
 CYCLE_LEVEL = 25
 ET = zoneinfo.ZoneInfo("America/New_York")
@@ -69,6 +71,9 @@ class NWSWatcher:
         while True:
             try:
                 schedule.run_pending()
+                if consume_scan_trigger():
+                    logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Manual scan trigger received")
+                    self.pipeline()
                 now = time.time()
                 current_interval = self._get_current_interval()
                 if current_interval != self._current_interval:

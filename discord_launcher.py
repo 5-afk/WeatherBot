@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
+from src.bot_control import request_scan, set_paused
 from src.kalshi_client import KalshiClient
 
 
@@ -126,6 +127,52 @@ class BotLauncher:
             launcher._start_process()
             await ctx.send("✅ KalshiBot restarted successfully.")
 
+        @self.bot.command(name="scan")
+        async def scan_cmd(ctx):
+            """Trigger an immediate market scan on the running bot process."""
+            if not launcher._is_running():
+                await ctx.send("KalshiBot is not running. Use `!start` first.")
+                return
+            request_scan()
+            await ctx.send("🔍 Manual scan requested — main.py will pick it up shortly.")
+
+        @self.bot.command(name="pause")
+        async def pause_cmd(ctx):
+            """Pause scheduled and manual trading scans."""
+            set_paused(True)
+            await ctx.send("⏸️ Bot paused. Use `!resume` to restart scanning.")
+
+        @self.bot.command(name="resume")
+        async def resume_cmd(ctx):
+            """Resume trading scans and request an immediate scan."""
+            if not launcher._is_running():
+                await ctx.send("KalshiBot is not running. Use `!start` first.")
+                return
+            set_paused(False)
+            request_scan()
+            await ctx.send("▶️ Bot resumed. Manual scan requested.")
+
+        @self.bot.command(name="pnl")
+        async def pnl_cmd(ctx):
+            """Show profit/loss and open risk summary."""
+            state = launcher._db_status()
+            monthly_pnl = launcher._scalar(
+                "SELECT COALESCE(SUM(realized_pnl), 0) FROM pnl "
+                "WHERE SUBSTR(created_at, 1, 7) = strftime('%Y-%m', 'now')",
+                0.0,
+            )
+            open_risk = launcher._scalar(
+                "SELECT COALESCE(SUM(stake), 0) FROM positions WHERE status = 'open'",
+                0.0,
+            )
+            await ctx.send(
+                "📊 P&L Summary\n"
+                f"Today: ${state['daily_pnl']:.2f}\n"
+                f"This month: ${monthly_pnl:.2f}\n"
+                f"Open risk: ${open_risk:.2f}\n"
+                f"Open positions: {state['open_positions']}"
+            )
+
         @self.bot.command(name="status")
         async def status(ctx):
             """Show launcher and bot process status."""
@@ -136,6 +183,7 @@ class BotLauncher:
             balance_line = f"Kalshi balance: {balance_str}"
             state = launcher._db_status()
             running = "Yes" if launcher._is_running() else "No"
+            paused = "Yes" if (PROJECT_ROOT / "data" / "paused.flag").exists() else "No"
             last_scan = launcher._last_scan_time()
             window = launcher._scan_window()
             if launcher._is_running():
@@ -149,6 +197,7 @@ class BotLauncher:
                     f"Open positions: {state['open_positions']} / 1\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
                     f"Scan window: {window}\n"
+                    f"Paused: {paused}\n"
                     f"Bot running: {running}\n"
                     f"Last scan: {last_scan}\n"
                     f"KalshiBot: ✅ Running (PID: {launcher.process.pid})\n"
@@ -165,6 +214,7 @@ class BotLauncher:
                     f"Open positions: {state['open_positions']} / 1\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
                     f"Scan window: {window}\n"
+                    f"Paused: {paused}\n"
                     f"Bot running: {running}\n"
                     f"Last scan: {last_scan}\n"
                     "KalshiBot: ⛔ Stopped"
@@ -326,7 +376,11 @@ class BotLauncher:
                 "!start   — start the trading bot\n"
                 "!stop    — stop the trading bot\n"
                 "!restart — restart the trading bot\n"
+                "!scan    — trigger immediate market scan\n"
+                "!pause   — pause trading scans\n"
+                "!resume  — resume trading and scan now\n"
                 "!status  — check if bot is running\n"
+                "!pnl     — show profit/loss summary\n"
                 "!balance — show real Kalshi account balance\n"
                 "!logs    — show last 30 log lines\n"
                 "!logsfull — upload full log file\n"
@@ -372,6 +426,18 @@ class BotLauncher:
             await ctx.send("⚠️ Switching to LIVE TRADING. Real money at risk.")
             launcher._update_env({"KALSHI_ENV": "prod", "DRY_RUN": "false"})
             await ctx.send("✅ KALSHI_ENV=prod and DRY_RUN=false written to .env. Restart the bot for changes to apply.")
+
+        required_commands = {
+            "start", "stop", "restart", "scan", "pause", "resume", "pnl",
+            "status", "balance", "logs", "logsfull",
+            "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
+        }
+        registered = {command.name for command in self.bot.commands}
+        missing = sorted(required_commands - registered)
+        if missing:
+            logging.error("Discord launcher missing commands: %s", missing)
+        else:
+            logging.info("Discord launcher registered commands: %s", sorted(registered))
 
     def _register_tasks(self):
         """Register the 60-second process health check loop."""
