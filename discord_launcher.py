@@ -55,6 +55,7 @@ class BotLauncher:
     def __init__(self):
         """Create Discord command handlers and initialize process state."""
         self.process = None
+        self.process_log_file = None
         self.start_time = None
         self.channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
         intents = discord.Intents.default()
@@ -382,6 +383,7 @@ class BotLauncher:
             if launcher.process is None:
                 return
             if launcher.process.poll() is not None:
+                launcher._close_process_log()
                 launcher.process = None
                 launcher.start_time = None
                 await launcher._send_channel("🚨 KalshiBot crashed unexpectedly! Use !start to restart.")
@@ -398,7 +400,22 @@ class BotLauncher:
 
     def _start_process(self):
         """Start main.py as a subprocess."""
-        self.process = subprocess.Popen(["python", "main.py"], cwd=PROJECT_ROOT)
+        log_dir = PROJECT_ROOT / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "bot.log"
+        self.process_log_file = log_path.open("a", encoding="utf-8", buffering=1)
+        self.process_log_file.write(
+            f"\n{datetime.now():%Y-%m-%d %H:%M:%S} LAUNCHER  Starting main.py subprocess\n"
+        )
+        venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
+        python_bin = str(venv_python) if venv_python.exists() else sys.executable
+        self.process = subprocess.Popen(
+            [python_bin, str(PROJECT_ROOT / "main.py")],
+            cwd=PROJECT_ROOT,
+            stdout=self.process_log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
         self.start_time = datetime.now()
 
     async def _stop_process(self):
@@ -413,6 +430,19 @@ class BotLauncher:
             await asyncio.to_thread(self.process.wait)
         self.process = None
         self.start_time = None
+        self._close_process_log()
+
+    def _close_process_log(self):
+        """Close the subprocess log file handle if open."""
+        if self.process_log_file is None:
+            return
+        try:
+            self.process_log_file.write(
+                f"{datetime.now():%Y-%m-%d %H:%M:%S} LAUNCHER  main.py subprocess ended\n"
+            )
+            self.process_log_file.close()
+        finally:
+            self.process_log_file = None
 
     def _is_running(self):
         """Return True when main.py is currently alive."""
