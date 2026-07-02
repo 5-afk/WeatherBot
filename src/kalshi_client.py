@@ -74,6 +74,25 @@ class KalshiClient:
                 raise requests.RequestException(f"{series_ticker}: {exc}") from exc
         return all_markets
 
+    def is_market_open(self, ticker: str) -> bool:
+        """Return True only when a market is currently open for orders.
+
+        Fetches GET /markets/{ticker}. A 404/410 (market gone or already
+        settled) or any non-"open" status is treated as not open, so the caller
+        can skip the trade instead of attempting an order Kalshi would reject
+        with a 410.
+        """
+        try:
+            data = self._request("GET", f"/markets/{ticker}", auth_required=False)
+        except requests.HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", None)
+            if status_code in (404, 410):
+                logging.info("Market %s returned %s — treating as settled.", ticker, status_code)
+                return False
+            raise
+        status = str(data.get("market", {}).get("status", "")).lower()
+        return status == "open"
+
     def place_limit_order(
         self,
         *,
@@ -123,6 +142,54 @@ class KalshiClient:
         self.base_url = self.PROD_URL
         self.env = "prod"
         logging.warning("SWITCHED TO LIVE TRADING — real money at risk")
+
+    def get_orderbook(self, ticker: str) -> dict[str, float | int]:
+        """Fetch order book for a market. Returns yes_bid_depth, yes_ask_depth, imbalance_score."""
+        neutral = {"imbalance_score": 0.5, "yes_bid_depth": 0, "yes_ask_depth": 0}
+        try:
+            data = self._request("GET", f"/markets/{ticker}/orderbook", auth_required=False)
+            orderbook = data.get("orderbook", data)
+            yes_bids = orderbook.get("yes", []) or []
+            no_bids = orderbook.get("no", []) or []
+
+            yes_bid_depth = sum(int(level[1]) for level in yes_bids if isinstance(level, (list, tuple)) and len(level) >= 2)
+            # YES ask depth is mirrored from NO bid side on Kalshi binary books
+            yes_ask_depth = sum(int(level[1]) for level in no_bids if isinstance(level, (list, tuple)) and len(level) >= 2)
+
+            total = yes_bid_depth + yes_ask_depth
+            imbalance_score = yes_bid_depth / total if total > 0 else 0.5
+            return {
+                "imbalance_score": round(float(imbalance_score), 4),
+                "yes_bid_depth": yes_bid_depth,
+                "yes_ask_depth": yes_ask_depth,
+            }
+        except Exception as exc:
+            logging.warning("Orderbook fetch failed for %s: %s", ticker, exc)
+            return neutral
+
+    def get_order_status(self, order_id: str) -> dict[str, Any]:
+        """Poll order status. Returns status, filled_count, remaining_count."""
+        try:
+            data = self._request("GET", f"/portfolio/orders/{order_id}", auth_required=True)
+            order = data.get("order", data)
+            return {
+                "status": str(order.get("status", "")).lower(),
+                "filled_count": int(order.get("filled_count", 0) or 0),
+                "remaining_count": int(order.get("remaining_count", 0) or 0),
+            }
+        except Exception as exc:
+            logging.warning("Order status fetch failed for %s: %s", order_id, exc)
+            return {"status": "unknown", "filled_count": 0, "remaining_count": 0}
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a resting order."""
+        try:
+            data = self._request("DELETE", f"/portfolio/orders/{order_id}", auth_required=True)
+            order = data.get("order", data)
+            return str(order.get("status", "")).lower() == "canceled"
+        except Exception as exc:
+            logging.warning("Order cancel failed for %s: %s", order_id, exc)
+            return False
 
     def get_balance(self) -> float | None:
         """Fetch real account balance with retry on connection errors."""

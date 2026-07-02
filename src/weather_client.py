@@ -22,6 +22,8 @@ class CityConfig:
     lon: float
     nws_station: str
     tz: str
+    nws_bias_f: float = -1.5
+    nws_low_bias_f: float = 1.0
 
     @property
     def high_series(self) -> str:
@@ -32,6 +34,11 @@ class CityConfig:
     def low_series(self) -> str:
         """Return the matching KXLOW series ticker for this city."""
         return self.ticker.replace("KXHIGH", "KXLOW")
+
+    @property
+    def lowt_series(self) -> str:
+        """Return the matching KXLOWT (overnight low) series ticker."""
+        return self.ticker.replace("KXHIGH", "KXLOWT")
 
     @property
     def short_code(self) -> str:
@@ -59,11 +66,19 @@ class NwsForecast:
 
 
 CITIES: dict[str, CityConfig] = {
-    "New York": CityConfig("New York", "KXHIGHNY", 40.7128, -74.0060, "KNYC", "America/New_York"),
-    "Chicago": CityConfig("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "KMDW", "America/Chicago"),
-    "Miami": CityConfig("Miami", "KXHIGHMIA", 25.7617, -80.1918, "KMIA", "America/New_York"),
-    "Los Angeles": CityConfig("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "KLAX", "America/Los_Angeles"),
-    "Denver": CityConfig("Denver", "KXHIGHDEN", 39.7392, -104.9903, "KDEN", "America/Denver"),
+    "New York": CityConfig("New York", "KXHIGHNY", 40.7128, -74.0060, "KNYC", "America/New_York", nws_bias_f=-1.5),
+    "Chicago": CityConfig("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "KMDW", "America/Chicago", nws_bias_f=-1.5),
+    "Miami": CityConfig("Miami", "KXHIGHMIA", 25.7617, -80.1918, "KMIA", "America/New_York", nws_bias_f=-1.5),
+    "Los Angeles": CityConfig("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "KLAX", "America/Los_Angeles", nws_bias_f=-1.5),
+    "Denver": CityConfig("Denver", "KXHIGHDEN", 39.7392, -104.9903, "KDEN", "America/Denver", nws_bias_f=-1.5),
+    "Seattle": CityConfig("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "KSEA", "America/Los_Angeles", nws_bias_f=-1.0),
+    "San Francisco": CityConfig("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "KSFO", "America/Los_Angeles", nws_bias_f=-1.0),
+    "Dallas": CityConfig("Dallas", "KXHIGHTDAL", 32.7767, -96.7970, "KDAL", "America/Chicago", nws_bias_f=-1.5),
+    "Minneapolis": CityConfig("Minneapolis", "KXHIGHTMIN", 44.9778, -93.2650, "KMSP", "America/Chicago", nws_bias_f=-1.5),
+    "Oklahoma City": CityConfig("Oklahoma City", "KXHIGHTOKC", 35.4676, -97.5164, "KOKC", "America/Chicago", nws_bias_f=-1.5),
+    "Atlanta": CityConfig("Atlanta", "KXHIGHTATL", 33.7490, -84.3880, "KATL", "America/New_York", nws_bias_f=-1.5),
+    "Boston": CityConfig("Boston", "KXHIGHTBOS", 42.3601, -71.0589, "KBOS", "America/New_York", nws_bias_f=-1.5),
+    "Washington DC": CityConfig("Washington DC", "KXHIGHTDC", 38.9072, -77.0369, "KDCA", "America/New_York", nws_bias_f=-1.5),
 }
 
 
@@ -84,9 +99,11 @@ class WeatherClient:
             "icon": os.getenv("OPEN_METEO_ICON_MODEL", "icon_seamless"),
         }
         self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
+        self.nws_low_bias_f = float(os.getenv("NWS_SUMMER_LOW_BIAS_F", "1.0"))
         self.expected_members = {
             "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
             "ecmwf": int(os.getenv("EXPECTED_ECMWF_MEMBERS", "51")),
+            "icon": int(os.getenv("EXPECTED_ICON_MEMBERS", "40")),
         }
         self._cache: dict[tuple[str, str, str, str], tuple[EnsembleForecast, datetime]] = {}
         self._cache_ttl = timedelta(minutes=10)
@@ -96,17 +113,17 @@ class WeatherClient:
         return list(CITIES.values())
 
     def watched_series_tickers(self) -> list[str]:
-        """Return all KXHIGH and KXLOW series tickers watched by the bot."""
+        """Return all KXHIGH, KXLOW, and KXLOWT series tickers watched by the bot."""
         series: list[str] = []
         for city in self.watched_cities():
-            series.extend([city.high_series, city.low_series])
+            series.extend([city.high_series, city.low_series, city.lowt_series])
         return series
 
     def city_for_market(self, series_ticker: str, market_ticker: str = "") -> CityConfig | None:
         """Match a Kalshi market or series ticker back to a configured city."""
         text = f"{series_ticker} {market_ticker}".upper()
         for city in self.watched_cities():
-            if city.high_series in text or city.low_series in text:
+            if city.high_series in text or city.low_series in text or city.lowt_series in text:
                 return city
         return None
 
@@ -117,7 +134,7 @@ class WeatherClient:
         target_date: date,
         market_type: str,
     ) -> EnsembleForecast:
-        """Fetch a GFS or ECMWF ensemble and reduce members to daily highs/lows."""
+        """Fetch a GFS, ECMWF, or ICON ensemble and reduce members to daily highs/lows."""
         model_name = self.model_names[model_key]
         cache_key = (city.name, model_key, str(target_date), market_type)
         cached = self._cache.get(cache_key)
@@ -222,12 +239,15 @@ class WeatherClient:
                 return NwsForecast(None, "No matching NWS forecast period", city.nws_station)
 
             temperature = self._safe_float(period.get("temperature"))
-            if (
-                temperature is not None
-                and market_type == "high"
-                and target_date.month in {6, 7, 8}
-            ):
-                temperature = round(temperature - self.nws_warm_bias_f, 2)
+            if temperature is not None and target_date.month in {6, 7, 8}:
+                if market_type == "high":
+                    # NWS warm bias for HIGH markets in summer — subtract correction
+                    bias = abs(city.nws_bias_f) if city.nws_bias_f else self.nws_warm_bias_f
+                    temperature = round(temperature - bias, 2)
+                elif market_type == "low":
+                    # LOW forecasts underestimated in summer — add correction
+                    low_bias = city.nws_low_bias_f if city.nws_low_bias_f else self.nws_low_bias_f
+                    temperature = round(temperature + low_bias, 2)
 
             return NwsForecast(
                 temperature,

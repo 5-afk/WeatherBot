@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -139,8 +140,9 @@ class Trader:
             logging.info("Daily Claude limit reached — math-only scan")
 
         market_rows: list[tuple[CityConfig, KalshiMarket, float]] = []
+        city_count = len(self.weather.watched_cities())
         for city in self.weather.watched_cities():
-            for series_ticker in (city.high_series, city.low_series):
+            for series_ticker in (city.high_series, city.low_series, city.lowt_series):
                 try:
                     markets = self.kalshi.list_markets(series_ticker)
                 except Exception as exc:
@@ -159,17 +161,27 @@ class Trader:
                 result = self._math_evaluate(city, market, ladder_multiplier)
                 if result:
                     candidates.append(result)
+                    edge = result[2]
                     logging.info(
-                        "[CANDIDATE] %s signal=%.2f edge=%.1f%% ev=%.4f",
-                        market.ticker,
-                        result[2].signal_score,
-                        (result[2].edge or 0.0) * 100,
-                        result[2].ev or 0.0,
+                        "[CANDIDATE] %s %.0fF %s | Edge: %.0f%% | EV: %.2f | Signal: %.2f | Imbalance: %.2f",
+                        city.short_code,
+                        edge.threshold_f or 0.0,
+                        (edge.side or "").upper(),
+                        (edge.edge or 0.0) * 100,
+                        edge.ev or 0.0,
+                        edge.signal_score,
+                        edge.imbalance_score,
                     )
             except Exception as exc:
                 logging.error("Eval failed %s: %s", market.ticker, exc)
 
-        logging.info("[CYCLE] Checked %d markets, %d candidates", total_checked, len(candidates))
+        logging.info(
+            "[CYCLE] Checked %d markets, %d candidates (%d cities x ~%d markets each)",
+            total_checked,
+            len(candidates),
+            city_count,
+            total_checked // city_count if city_count else 0,
+        )
         if not candidates:
             logging.info("[CYCLE] No qualifying candidates — scan complete")
             self._maybe_record_day_end()
@@ -244,6 +256,7 @@ class Trader:
             return None
 
         current_temp_f = self._current_temp_f(city)
+        imbalance_score = self._fetch_imbalance(market)
         edge = self.edge_engine.evaluate(
             market,
             gfs=gfs,
@@ -252,6 +265,7 @@ class Trader:
             icon=icon,
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
+            imbalance_score=imbalance_score,
         )
         if not edge.should_trade:
             if edge.reason.startswith("Pre-Claude gate failed"):
@@ -304,6 +318,18 @@ class Trader:
         else:
             self._live_bet(city, market, edge, claude, size)
 
+    def _fetch_imbalance(self, market: KalshiMarket) -> float:
+        """Fetch order book imbalance; return neutral 0.5 on failure."""
+        yes_ask = market.yes_ask
+        no_ask = market.no_ask
+        if yes_ask is None and no_ask is None:
+            return 0.5
+        try:
+            book = self.kalshi.get_orderbook(market.ticker)
+            return float(book.get("imbalance_score", 0.5))
+        except Exception:
+            return 0.5
+
     def _batch_candidate_payload(
         self,
         city: CityConfig,
@@ -316,6 +342,7 @@ class Trader:
             "ticker": market.ticker,
             "city": city.name,
             "side": edge.side,
+            "market_type": self.edge_engine.market_type_label(market),
             "threshold_f": edge.threshold_f,
             "market_price": edge.ask_price,
             "edge_pct": round((edge.edge or 0.0) * 100, 1),
@@ -323,6 +350,7 @@ class Trader:
             "signal_score": edge.signal_score,
             "buffer_score": edge.buffer_score,
             "observation_score": edge.observation_score,
+            "imbalance_score": edge.imbalance_score,
             "confidence": round(edge.confidence * 100, 1),
             "gfs_probability": edge.gfs_probability_yes,
             "ecmwf_probability": edge.ecmwf_probability_yes,
@@ -451,6 +479,14 @@ class Trader:
             return
 
         try:
+            if not self.kalshi.is_market_open(market.ticker):
+                self._log_skip(city, market, "Market already settled — skipping order", edge)
+                return
+        except requests.RequestException as exc:
+            self._log_skip(city, market, f"Market status check failed: {exc}", edge)
+            return
+
+        try:
             response = self.kalshi.place_limit_order(
                 ticker=market.ticker,
                 side=edge.side or "yes",
@@ -462,6 +498,33 @@ class Trader:
             return
 
         order_id = str(response.get("order", {}).get("order_id") or response.get("order_id") or "")
+        if not order_id:
+            self._log_skip(city, market, "Kalshi order placed but no order_id returned.", edge)
+            return
+
+        filled_count = 0
+        for _attempt in range(6):
+            time.sleep(5)
+            status = self.kalshi.get_order_status(order_id)
+            if status["status"] == "filled":
+                filled_count = status["filled_count"]
+                logging.info(
+                    "[BET CONFIRMED] %s %s | %d contracts filled",
+                    market.ticker,
+                    edge.side,
+                    filled_count,
+                )
+                break
+            if status["status"] == "canceled":
+                logging.warning("[BET CANCELED] %s order was canceled before filling", market.ticker)
+                return
+
+        if filled_count < 1:
+            self.kalshi.cancel_order(order_id)
+            logging.warning("[BET TIMEOUT] %s order not filled in 30s — canceled", market.ticker)
+            return
+
+        actual_stake = round(filled_count * (edge.limit_price or 0.0), 2)
         logging.getLogger().log(
             BET_LEVEL,
             "[BET] %s %.0fF | Edge: %.1f%% | EV: %.4f | Signal: %.2f | Buffer: %s | $%.2f on %s @ $%.2f | Kelly: $%.2f | Claude: GO -- %s",
@@ -471,7 +534,7 @@ class Trader:
             edge.ev or 0.0,
             edge.signal_score,
             self._buffer_text(edge),
-            size.stake,
+            actual_stake,
             (edge.side or "").upper(),
             edge.limit_price or 0.0,
             size.kelly_size,
@@ -481,9 +544,9 @@ class Trader:
             ticker=market.ticker,
             city=city.name,
             side=edge.side or "unknown",
-            contracts=size.contracts,
+            contracts=filled_count,
             price=edge.limit_price or 0.0,
-            stake=size.stake,
+            stake=actual_stake,
             dry_run=False,
             order_id=order_id,
         )
@@ -512,12 +575,14 @@ class Trader:
         market_price = edge.ask_price if edge else market.yes_ask
         edge_value = edge.edge if edge else None
         logging.warning(
-            "[SKIP] %s %s | Edge: %s | EV: %s | Signal: %.2f | Buffer: %s | Market: %s | Reason: %s",
+            "[SKIP] %s %s %s | Edge: %s | EV: %s | Signal: %.2f | Imbalance: %.2f | Buffer: %s | Market: %s | Reason: %s",
             city.short_code,
             f"{threshold:.0f}F" if threshold is not None else "n/a",
+            (edge.side or "").upper() if edge and edge.side else "",
             f"{edge_value:.1%}" if edge_value is not None else "n/a",
             f"{edge.ev:.4f}" if edge and edge.ev is not None else "n/a",
             edge.signal_score if edge else 0.5,
+            edge.imbalance_score if edge else 0.5,
             self._buffer_text(edge),
             f"${market_price:.2f}" if market_price is not None else "n/a",
             reason,
@@ -650,7 +715,11 @@ class Trader:
 
     def _send_bet_alert(self, city: CityConfig, edge: EdgeDecision, size: PositionSize, *, dry_run: bool) -> None:
         """Send a readable Discord alert for a placed or simulated bet."""
-        prefix = "🧪 DRY RUN" if dry_run else "💰 BET PLACED"
+        side_label = (edge.side or "yes").upper()
+        if dry_run:
+            prefix = f"🧪 DRY RUN BET {side_label}"
+        else:
+            prefix = f"💰 BET {side_label}"
         self._send_discord(
             f"{self._user_ping()}{prefix}\n"
             f"City: {city.name}\n"
