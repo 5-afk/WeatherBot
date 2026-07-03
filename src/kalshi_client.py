@@ -7,6 +7,7 @@ code separate makes the beginner-friendly trading pipeline easier to follow.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -77,21 +78,52 @@ class KalshiClient:
     def is_market_open(self, ticker: str) -> bool:
         """Return True only when a market is currently open for orders.
 
-        Fetches GET /markets/{ticker}. A 404/410 (market gone or already
-        settled) or any non-"open" status is treated as not open, so the caller
-        can skip the trade instead of attempting an order Kalshi would reject
-        with a 410.
+        Fetches GET /markets/{ticker}. Orders can only be placed on markets whose
+        status is "open"; both "closed" (no longer accepting orders) and "settled"
+        (outcome determined) are skipped, but they are logged distinctly so the two
+        states can be told apart. A 404/410 means the market is gone/settled.
         """
         try:
             data = self._request("GET", f"/markets/{ticker}", auth_required=False)
         except requests.HTTPError as exc:
             status_code = getattr(exc.response, "status_code", None)
             if status_code in (404, 410):
-                logging.info("Market %s returned %s — treating as settled.", ticker, status_code)
+                logging.info("Market %s returned HTTP %s — treating as settled/gone.", ticker, status_code)
                 return False
             raise
-        status = str(data.get("market", {}).get("status", "")).lower()
-        return status == "open"
+
+        market = data.get("market", {})
+        status = str(market.get("status", "")).lower()
+        close_time = market.get("close_time")
+
+        # Full raw response for diagnosis of status/close_time handling.
+        logging.info("[MARKET STATUS] %s raw response: %s", ticker, json.dumps(data, default=str))
+
+        if status == "open":
+            return True
+
+        if status == "settled":
+            logging.info(
+                "[SKIP] Market %s already settled (outcome determined) | status=%s close_time=%s",
+                ticker,
+                status,
+                close_time,
+            )
+        elif status == "closed":
+            logging.info(
+                "[SKIP] Market %s closed (no longer accepting orders, not yet settled) | status=%s close_time=%s",
+                ticker,
+                status,
+                close_time,
+            )
+        else:
+            logging.info(
+                "[SKIP] Market %s not open | status=%s close_time=%s",
+                ticker,
+                status or "(empty)",
+                close_time,
+            )
+        return False
 
     def place_limit_order(
         self,
