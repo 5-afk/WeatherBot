@@ -163,22 +163,17 @@ class KalshiClient:
         body.pop("yes_price", None)
         body.pop("no_price", None)
 
+        # Log the EXACT request body being sent to Kalshi before the POST.
+        logging.warning("Order request body: %s", json.dumps(body, indent=2))
+
         try:
             return self._request("POST", "/portfolio/orders", json=body, auth_required=True)
         except requests.HTTPError as exc:
-            status_code = getattr(exc.response, "status_code", None)
-            if status_code == 410:
-                # Fetch full market data to discover which field distinguishes
-                # "active and accepting orders" from "active but order book closed".
-                try:
-                    debug_resp = self._request("GET", f"/markets/{ticker}", auth_required=False)
-                    logging.warning(
-                        "410 debug for %s — complete market JSON: %s",
-                        ticker,
-                        json.dumps(debug_resp, indent=2, default=str),
-                    )
-                except Exception as debug_exc:
-                    logging.warning("410 debug fetch failed for %s: %s", ticker, debug_exc)
+            response = exc.response
+            status_code = getattr(response, "status_code", None)
+            response_text = getattr(response, "text", "") if response is not None else ""
+            # Log the EXACT response body — this contains Kalshi's error message.
+            logging.warning("Order response %s: %s", status_code, response_text)
             raise
 
     def test_connection(self) -> bool:
@@ -338,29 +333,61 @@ class KalshiClient:
 
     def _normalize_market(self, raw: dict[str, Any]) -> KalshiMarket:
         """Convert Kalshi's raw JSON into a stable dataclass."""
+        logging.debug("Raw market fields: %s", list(raw.keys()))
         logging.debug(
-            "Raw Kalshi prices ticker=%s yes_ask=%r no_ask=%r",
+            "Raw market sample: %s",
+            {
+                k: raw.get(k)
+                for k in (
+                    "yes_ask",
+                    "no_ask",
+                    "yes_ask_dollars",
+                    "no_ask_dollars",
+                    "yes_ask_price",
+                    "no_ask_price",
+                )
+            },
+        )
+        yes_bid = self._extract_price(raw, "yes_bid")
+        yes_ask = self._extract_price(raw, "yes_ask")
+        no_bid = self._extract_price(raw, "no_bid")
+        no_ask = self._extract_price(raw, "no_ask")
+        logging.debug(
+            "Parsed prices ticker=%s yes_ask=%r no_ask=%r",
             raw.get("ticker", ""),
-            raw.get("yes_ask"),
-            raw.get("no_ask"),
+            yes_ask,
+            no_ask,
         )
         return KalshiMarket(
             ticker=str(raw.get("ticker", "")),
             series_ticker=str(raw.get("series_ticker", "")),
             title=str(raw.get("title", "")),
             subtitle=str(raw.get("subtitle", "")),
-            yes_bid=self._price_to_dollars(raw.get("yes_bid_dollars")),
-            yes_ask=self._price_to_dollars(raw.get("yes_ask_dollars")),
-            no_bid=self._price_to_dollars(raw.get("no_bid_dollars")),
-            no_ask=self._price_to_dollars(raw.get("no_ask_dollars")),
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            no_bid=no_bid,
+            no_ask=no_ask,
             close_time=self._parse_time(raw.get("close_time")),
             settlement_time=self._parse_time(raw.get("settlement_time") or raw.get("expected_expiration_time")),
             raw=raw,
         )
 
+    def _extract_price(self, raw: dict[str, Any], base: str) -> float | None:
+        """Read a price from whichever field Kalshi returns.
+
+        Kalshi's /markets list endpoint returns integer cents (e.g. yes_ask=36),
+        while some endpoints return dollar strings (e.g. yes_ask_dollars="0.36").
+        Prefer the explicit dollar string when present, otherwise treat the base
+        field as integer cents.
+        """
+        dollars = raw.get(f"{base}_dollars")
+        if dollars is not None:
+            return self._price_to_dollars(dollars)
+        return self._cents_to_dollars(raw.get(base))
+
     @staticmethod
     def _price_to_dollars(value: Any) -> float | None:
-        """Convert Kalshi cents or decimal dollars into decimal dollars."""
+        """Convert a Kalshi dollar-string/decimal value into decimal dollars."""
         if value is None:
             return None
         try:
@@ -370,8 +397,21 @@ class KalshiClient:
         if 0 <= number <= 1.0:
             return number
         if number > 1.0:
-            return number / 100
+            return round(number / 100, 4)
         return None
+
+    @staticmethod
+    def _cents_to_dollars(value: Any) -> float | None:
+        """Convert an integer-cents price (1-99) into decimal dollars."""
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number <= 0:
+            return None
+        return round(number / 100, 4)
 
     @staticmethod
     def _parse_time(value: Any) -> datetime | None:
