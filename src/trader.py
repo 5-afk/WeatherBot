@@ -301,6 +301,16 @@ class Trader:
     ) -> None:
         """Size and place the bet after the single batch Claude decision."""
         del real_balance
+        ask_price = edge.ask_price
+        if ask_price is not None and ask_price < 0.05:
+            logging.warning(
+                "[SKIP] %s %s ask price $%.2f too low — market effectively resolved",
+                market.ticker,
+                (edge.side or "").upper(),
+                ask_price,
+            )
+            self._log_skip(city, market, f"Ask price ${ask_price:.2f} too low — market effectively resolved", edge)
+            return
         current_budget = self.risk.get_todays_budget()
         if current_budget < 1.0:
             logging.warning("No budget remaining")

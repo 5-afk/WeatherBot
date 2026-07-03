@@ -13,13 +13,34 @@ from src.kalshi_client import KalshiMarket
 from src.weather_client import NwsForecast
 
 
-def estimate_probability(forecast_temp_f: float, threshold_f: float, market_type: str) -> float:
-    """Estimate YES probability from NWS forecast using a normal CDF (sigma=3.5°F)."""
+def _norm_cdf(x: float, mean: float, sigma: float) -> float:
+    """Return P(X <= x) for a normal distribution with the given mean and sigma."""
+    return 0.5 * (1 + math.erf((x - mean) / (sigma * math.sqrt(2))))
+
+
+def estimate_probability(
+    forecast_temp_f: float,
+    threshold_f: float,
+    market_type: str,
+    strike_type: str = "greater",
+    upper_threshold_f: float | None = None,
+) -> float:
+    """Estimate YES probability from an NWS forecast using a normal CDF (sigma=3.5°F).
+
+    For "between" markets (e.g. B-prefix brackets), YES resolves only when the
+    temperature lands inside the bracket, so the probability is
+    P(threshold <= temp < upper), NOT P(temp > threshold). This makes far-off
+    brackets correctly show tiny probability and negative EV.
+    """
     sigma = float(os.getenv("NWS_FORECAST_SIGMA_F", "3.5"))
-    z = (threshold_f - forecast_temp_f) / (sigma * math.sqrt(2))
-    cdf_below = 0.5 * (1 + math.erf(z))
-    prob = cdf_below if market_type.lower() == "low" else (1 - cdf_below)
-    return round(float(prob), 4)
+    if strike_type == "between":
+        upper = upper_threshold_f if upper_threshold_f is not None else threshold_f + 2.0
+        p_above_lower = 1 - _norm_cdf(threshold_f, forecast_temp_f, sigma)
+        p_above_upper = 1 - _norm_cdf(upper, forecast_temp_f, sigma)
+        return round(max(0.0, p_above_lower - p_above_upper), 4)
+    if market_type.lower() == "low":
+        return round(_norm_cdf(threshold_f, forecast_temp_f, sigma), 4)
+    return round(1 - _norm_cdf(threshold_f, forecast_temp_f, sigma), 4)
 
 
 @dataclass(frozen=True)
@@ -98,7 +119,31 @@ class EdgeEngine:
         if nws_temp is None:
             return self._skip("NWS gridded forecast unavailable.", market_type, threshold, hours_until_settlement)
 
-        nws_probability_yes = estimate_probability(nws_temp, threshold, market_type)
+        strike_type = self.strike_type(market)
+        lower_threshold = threshold
+        upper_threshold: float | None = None
+        if strike_type == "between":
+            floor = self._safe_float(market.raw.get("floor_strike"))
+            cap = self._safe_float(market.raw.get("cap_strike"))
+            if floor is not None:
+                lower_threshold = floor
+            if cap is not None:
+                upper_threshold = cap
+            logging.debug(
+                "between market %s bracket lower=%s upper=%s (forecast=%.1f)",
+                market.ticker,
+                lower_threshold,
+                upper_threshold if upper_threshold is not None else lower_threshold + 2.0,
+                nws_temp,
+            )
+
+        nws_probability_yes = estimate_probability(
+            nws_temp,
+            lower_threshold,
+            market_type,
+            strike_type,
+            upper_threshold,
+        )
 
         yes_decision = self._evaluate_side(
             market,
@@ -167,9 +212,9 @@ class EdgeEngine:
                 nws_probability_yes=nws_probability_yes,
                 nws_temp=nws_temp,
             )
-        if ask_price < 0.05 and hours_until_settlement < 6:
+        if ask_price < 0.05:
             return self._skip(
-                f"Market price ${ask_price:.2f} with {hours_until_settlement:.1f}h left is effectively settled",
+                f"Ask price ${ask_price:.2f} too low — market effectively resolved (Kalshi rejects orders)",
                 market_type,
                 threshold,
                 hours_until_settlement,
@@ -392,6 +437,18 @@ class EdgeEngine:
     def market_type_label(self, market: KalshiMarket) -> str:
         """Return HIGH or LOW for Claude payloads."""
         return self.market_type(market).upper()
+
+    def strike_type(self, market: KalshiMarket) -> str:
+        """Return Kalshi's strike_type (e.g. 'greater', 'less', 'between')."""
+        return str(market.raw.get("strike_type", "")).lower()
+
+    @staticmethod
+    def _safe_float(value: object) -> float | None:
+        """Convert a value to float, returning None when conversion fails."""
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
 
     def parse_threshold(self, market: KalshiMarket) -> float | None:
         """Extract one Fahrenheit threshold from the market title/subtitle."""
