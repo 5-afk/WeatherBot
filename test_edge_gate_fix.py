@@ -27,7 +27,6 @@ def test_mia_style_gate_passes() -> None:
         market_type="high",
         threshold_f=94.0,
         gfs_probability_yes=1.0,
-        ecmwf_probability_yes=1.0,
         nws_adjusted_temperature_f=99.0,
         hours_until_settlement=12.0,
         buffer_score=0.8,
@@ -41,7 +40,7 @@ def test_mia_style_gate_passes() -> None:
 
 
 def test_model_disagreement_reaches_scoring() -> None:
-    """GFS/ECMWF disagreement should lower score, not short-circuit evaluation."""
+    """GFS/ICON disagreement should lower score, not short-circuit evaluation."""
     engine = EdgeEngine()
     settlement = datetime.now(timezone.utc) + timedelta(hours=12)
     market = KalshiMarket(
@@ -58,15 +57,15 @@ def test_model_disagreement_reaches_scoring() -> None:
         raw={"yes_ask_size_fp": 100, "no_ask_size_fp": 100},
     )
     gfs = EnsembleForecast("gfs", [96.0] * 25 + [92.0] * 6, 95.2, 31)
-    ecmwf = EnsembleForecast("ecmwf", [96.0] * 20 + [92.0] * 31, 93.6, 51)
+    icon = EnsembleForecast("icon", [96.0] * 16 + [92.0] * 24, 93.6, 40)
     nws = NwsForecast(99.0, "hot", "synthetic")
 
-    decision = engine.evaluate(market, gfs=gfs, ecmwf=ecmwf, nws=nws)
+    decision = engine.evaluate(market, gfs=gfs, icon=icon, nws=nws)
 
     assert "GFS says" not in decision.reason
-    assert "ECMWF says" not in decision.reason
+    assert "ICON says" not in decision.reason
     assert round(decision.gfs_probability_yes or 0.0, 2) == 0.81
-    assert round(decision.ecmwf_probability_yes or 0.0, 2) == 0.39
+    assert round(decision.icon_probability_yes or 0.0, 2) == 0.40
     assert decision.signal_score != 0.5
 
 

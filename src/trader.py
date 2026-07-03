@@ -117,7 +117,7 @@ class Trader:
         self._scan_bets = 0
         self._scan_skips = 0
         self._scan_signals = 0
-        self._weather_cache: dict[tuple[str, str, str], tuple[EnsembleForecast, EnsembleForecast, EnsembleForecast, NwsForecast]] = {}
+        self._weather_cache: dict[tuple[str, str, str], tuple[EnsembleForecast, EnsembleForecast, NwsForecast]] = {}
         self._observation_cache: dict[str, float | None] = {}
 
         if not self.dry_run:
@@ -276,16 +276,15 @@ class Trader:
             if cached_weather is None:
                 weather_bundle = (
                     self.weather.get_ensemble_forecast(city, "gfs", target_date, market_type),
-                    self.weather.get_ensemble_forecast(city, "ecmwf", target_date, market_type),
                     self.weather.get_ensemble_forecast(city, "icon", target_date, market_type),
                     self.weather.get_nws_forecast(city, target_date, market_type),
                 )
                 with self._scan_lock:
                     if cache_key not in self._weather_cache:
                         self._weather_cache[cache_key] = weather_bundle
-                    gfs, ecmwf, icon, nws = self._weather_cache[cache_key]
+                    gfs, icon, nws = self._weather_cache[cache_key]
             else:
-                gfs, ecmwf, icon, nws = cached_weather
+                gfs, icon, nws = cached_weather
         except Exception as exc:
             logging.debug("Weather fetch failed %s: %s", market.ticker, exc)
             self._log_skip(city, market, f"Weather fetch failed: {exc}", None)
@@ -296,7 +295,6 @@ class Trader:
         edge = self.edge_engine.evaluate(
             market,
             gfs=gfs,
-            ecmwf=ecmwf,
             nws=nws,
             icon=icon,
             current_temp_f=current_temp_f,
@@ -389,7 +387,6 @@ class Trader:
             "imbalance_score": edge.imbalance_score,
             "confidence": round(edge.confidence * 100, 1),
             "gfs_probability": edge.gfs_probability_yes,
-            "ecmwf_probability": edge.ecmwf_probability_yes,
             "icon_probability": edge.icon_probability_yes,
             "hours_until_settlement": edge.hours_until_settlement,
             "nws_adjusted_f": edge.nws_adjusted_temperature_f,
@@ -650,7 +647,7 @@ class Trader:
         market: KalshiMarket,
         edge: EdgeDecision,
         gfs: EnsembleForecast,
-        ecmwf: EnsembleForecast,
+        icon: EnsembleForecast,
         nws: NwsForecast,
         enrichment: dict[str, Any],
     ) -> dict[str, Any]:
@@ -663,9 +660,9 @@ class Trader:
             "temperature_threshold_f": edge.threshold_f,
             "side": edge.side,
             "gfs_probability": gfs.member_temperatures_f and edge.gfs_probability_yes,
-            "ecmwf_probability": ecmwf.member_temperatures_f and edge.ecmwf_probability_yes,
+            "icon_probability": icon.member_temperatures_f and edge.icon_probability_yes,
             "gfs_members": gfs.member_count,
-            "ecmwf_members": ecmwf.member_count,
+            "icon_members": icon.member_count,
             "nws_forecast_f": nws.temperature_f,
             "nws_adjusted_forecast_f": edge.nws_adjusted_temperature_f,
             "nws_short_forecast": nws.short_forecast,

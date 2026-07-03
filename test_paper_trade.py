@@ -104,7 +104,7 @@ def claude_payload(
     market: KalshiMarket,
     decision: EdgeDecision,
     gfs: EnsembleForecast,
-    ecmwf: EnsembleForecast,
+    icon: EnsembleForecast,
     nws: NwsForecast,
     enrichment: dict[str, object],
 ) -> dict[str, object]:
@@ -116,9 +116,9 @@ def claude_payload(
         "temperature_threshold_f": decision.threshold_f,
         "side": decision.side,
         "gfs_probability": decision.gfs_probability_yes,
-        "ecmwf_probability": decision.ecmwf_probability_yes,
+        "icon_probability": decision.icon_probability_yes,
         "gfs_members": gfs.member_count,
-        "ecmwf_members": ecmwf.member_count,
+        "icon_members": icon.member_count,
         "nws_forecast_f": nws.temperature_f,
         "nws_adjusted_forecast_f": decision.nws_adjusted_temperature_f,
         "nws_short_forecast": nws.short_forecast,
@@ -162,7 +162,7 @@ def summarize_market(
     print(f"City: {city.name}")
     print(f"Threshold: {fmt_temp(decision.threshold_f)}")
     print(f"GFS probability YES: {fmt_pct(decision.gfs_probability_yes)}")
-    print(f"ECMWF probability YES: {fmt_pct(decision.ecmwf_probability_yes)}")
+    print(f"ICON probability YES: {fmt_pct(decision.icon_probability_yes)}")
     print(f"NWS forecast: {fmt_temp(nws.temperature_f)} ({nws.short_forecast})")
     print(f"Adjusted NWS forecast: {fmt_temp(decision.nws_adjusted_temperature_f)}")
     print(f"Edge: {fmt_pct(decision.edge)}")
@@ -213,13 +213,13 @@ def main() -> None:
 
         try:
             gfs = weather.get_ensemble_forecast(city, "gfs", target_date, market_type)
-            ecmwf = weather.get_ensemble_forecast(city, "ecmwf", target_date, market_type)
+            icon = weather.get_ensemble_forecast(city, "icon", target_date, market_type)
             nws = weather.get_nws_forecast(city, target_date, market_type)
         except Exception as exc:
             print(f"\nMarket: {market.ticker}\nCity: {city.name}\nWould bet: NO\nReason: Weather fetch failed: {exc}")
             continue
 
-        decision = edge_engine.evaluate(market, gfs=gfs, ecmwf=ecmwf, nws=nws)
+        decision = edge_engine.evaluate(market, gfs=gfs, icon=icon, nws=nws)
         claude: ClaudeDecision | None = None
         size: PositionSize | None = None
         would_bet = False
@@ -227,7 +227,7 @@ def main() -> None:
 
         if decision.should_trade:
             enrichment = enricher.enrich(city, target_date.isoformat())
-            payload = claude_payload(city, market, decision, gfs, ecmwf, nws, enrichment)
+            payload = claude_payload(city, market, decision, gfs, icon, nws, enrichment)
             claude = claude_checker.check(payload)
             if claude.approved:
                 mock_market_price = float(raw["yes_ask_dollars"])

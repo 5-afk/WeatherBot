@@ -104,14 +104,12 @@ class WeatherClient:
         self.nws_user_agent = os.getenv("NWS_USER_AGENT", "kalshi-weather-bot/1.0")
         self.model_names = {
             "gfs": os.getenv("OPEN_METEO_GFS_MODEL", "gfs_seamless"),
-            "ecmwf": os.getenv("OPEN_METEO_ECMWF_MODEL", "ecmwf_ifs025"),
             "icon": os.getenv("OPEN_METEO_ICON_MODEL", "icon_seamless"),
         }
         self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
         self.nws_low_bias_f = float(os.getenv("NWS_SUMMER_LOW_BIAS_F", "1.0"))
         self.expected_members = {
             "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
-            "ecmwf": int(os.getenv("EXPECTED_ECMWF_MEMBERS", "51")),
             "icon": int(os.getenv("EXPECTED_ICON_MEMBERS", "40")),
         }
         # Cache at (city, model, date) level — one fetch yields both HIGH and LOW
@@ -154,17 +152,17 @@ class WeatherClient:
         """Pre-fetch all ensemble data sequentially before market evaluation begins.
 
         Fills the (city, model, date) cache once per scan cycle with staggered
-        delays (5s initial cooldown, 3.0s between models, 4.0s between cities)
+        delays (5s initial cooldown, 2.0s between models, 4.0s between cities)
         so the parallel evaluation phase hits cache instead of hammering Open-Meteo.
         A 429 is logged and skipped (no aggressive retry); affected cities fall back
-        to fewer models for this cycle.
+        to GFS-only for this cycle.
         """
         logging.info("Prewarming cache — waiting 5s before first fetch...")
         time.sleep(5.0)
         for city in cities:
-            for model_key in ("gfs", "ecmwf", "icon"):
+            for model_key in ("gfs", "icon"):
                 self.get_ensemble_forecast(city, model_key, target_date, "high", retries=1)
-                time.sleep(3.0)
+                time.sleep(2.0)
             time.sleep(4.0)
 
     def get_ensemble_forecast(
@@ -173,13 +171,19 @@ class WeatherClient:
         model_key: str,
         target_date: date,
         market_type: str,
-        retries: int = 3,
+        retries: int = 0,
     ) -> EnsembleForecast:
-        """Fetch a GFS, ECMWF, or ICON ensemble and reduce members to daily highs/lows.
+        """Fetch a GFS or ICON ensemble and reduce members to daily highs/lows.
 
         Caches both the HIGH and LOW member distributions per (city, model, date)
         so HIGH and LOW markets for the same city reuse a single API call.
+
+        Single attempt only: on a 429 (or any error) we log and immediately return
+        an empty forecast. No retry, no backoff, no sleeping in the evaluation path
+        — staggering belongs in prewarm_cache. The ``retries`` argument is retained
+        for call-site compatibility but ignored.
         """
+        del retries
         model_name = self.model_names[model_key]
         cache_key = (city.name, model_key, str(target_date))
         want = "high" if market_type == "high" else "low"
@@ -199,48 +203,39 @@ class WeatherClient:
             "models": model_name,
         }
         empty = EnsembleForecast(model_name, [], None, 0)
-        for attempt in range(retries):
-            try:
-                with self._api_semaphore:
-                    response = self.session.get(
-                        self.OPEN_METEO_ENSEMBLE_URL,
-                        params=params,
-                        timeout=30,
-                    )
-                if response.status_code == 429:
-                    if attempt >= retries - 1:
-                        logging.warning(
-                            "Open-Meteo rate limited for %s %s — skipping this cycle.",
-                            city.name,
-                            model_key,
-                        )
-                        return empty
-                    wait = 2**attempt * 5
-                    logging.warning("Open-Meteo rate limited, waiting %ds", wait)
-                    time.sleep(wait)
-                    continue
-                response.raise_for_status()
-                bundle = self._parse_ensemble_bundle(
-                    response.json(),
-                    model_name=model_name,
-                    model_key=model_key,
-                    target_date=target_date,
-                    city=city,
+        try:
+            with self._api_semaphore:
+                response = self.session.get(
+                    self.OPEN_METEO_ENSEMBLE_URL,
+                    params=params,
+                    timeout=30,
                 )
-                with self._cache_lock:
-                    self._cache[cache_key] = (bundle, datetime.now() + self._cache_ttl)
-                return bundle[want]
-            except Exception as exc:
-                if attempt >= retries - 1:
-                    logging.warning(
-                        "Ensemble forecast failed for %s %s: %s",
-                        city.name,
-                        model_key,
-                        exc,
-                    )
-                    return empty
-                time.sleep(2**attempt)
-        return empty
+            if response.status_code == 429:
+                logging.warning(
+                    "Open-Meteo rate limited for %s %s — skipping this cycle.",
+                    city.name,
+                    model_key,
+                )
+                return empty
+            response.raise_for_status()
+            bundle = self._parse_ensemble_bundle(
+                response.json(),
+                model_name=model_name,
+                model_key=model_key,
+                target_date=target_date,
+                city=city,
+            )
+            with self._cache_lock:
+                self._cache[cache_key] = (bundle, datetime.now() + self._cache_ttl)
+            return bundle[want]
+        except Exception as exc:
+            logging.warning(
+                "Ensemble forecast failed for %s %s: %s",
+                city.name,
+                model_key,
+                exc,
+            )
+            return empty
 
     def _parse_ensemble_bundle(
         self,

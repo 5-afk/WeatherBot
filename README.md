@@ -1,13 +1,13 @@
 # Kalshi Weather Bot
 
-This is a beginner-friendly Python 3.11+ trading bot for Kalshi weather prediction markets. It starts in dry-run mode, watches NWS/GFS model cycle release times, scans KXHIGH/KXLOW markets, compares GFS and ECMWF ensembles against NWS forecasts, asks Claude for a conservative sanity check, and only then simulates or places a limit order.
+This is a beginner-friendly Python 3.11+ trading bot for Kalshi weather prediction markets. It starts in dry-run mode, watches NWS/GFS model cycle release times, scans KXHIGH/KXLOW markets, compares GFS and ICON ensembles against NWS forecasts, asks Claude for a conservative sanity check, and only then simulates or places a limit order.
 
 ## What It Does
 
 - Runs the full pipeline at 03:30, 09:30, 15:30, and 21:30 UTC when new NWS/GFS cycle data should be available.
 - Runs a backup scan every 30 minutes.
 - Watches New York, Chicago, Miami, Los Angeles, and Denver KXHIGH/KXLOW markets.
-- Pulls free Open-Meteo GFS and ECMWF ensemble weather data.
+- Pulls free Open-Meteo GFS and ICON ensemble weather data.
 - Cross-checks NWS point forecasts using the correct settlement station area.
 - Trades only in dry-run mode unless `DRY_RUN=false`.
 - Uses SQLite at `data/positions.db` and JSON P&L at `data/pnl.json`.
