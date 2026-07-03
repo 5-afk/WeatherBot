@@ -66,12 +66,18 @@ class NwsForecast:
     source: str
 
 
-CITIES: dict[str, CityConfig] = {
+# Original 5 cities — always scanned. Kept first so CITY_COUNT=5 selects exactly these.
+ORIGINAL_CITIES: dict[str, CityConfig] = {
     "New York": CityConfig("New York", "KXHIGHNY", 40.7128, -74.0060, "KNYC", "America/New_York", nws_bias_f=-1.5),
     "Chicago": CityConfig("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "KMDW", "America/Chicago", nws_bias_f=-1.5),
     "Miami": CityConfig("Miami", "KXHIGHMIA", 25.7617, -80.1918, "KMIA", "America/New_York", nws_bias_f=-1.5),
     "Los Angeles": CityConfig("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "KLAX", "America/Los_Angeles", nws_bias_f=-1.5),
     "Denver": CityConfig("Denver", "KXHIGHDEN", 39.7392, -104.9903, "KDEN", "America/Denver", nws_bias_f=-1.5),
+}
+
+# 8 expansion cities — enabled only when CITY_COUNT >= 13. Temporarily disabled by
+# default (CITY_COUNT=5) to stay within Open-Meteo's free-tier rate limit.
+EXTENDED_CITIES: dict[str, CityConfig] = {
     "Seattle": CityConfig("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "KSEA", "America/Los_Angeles", nws_bias_f=-1.0),
     "San Francisco": CityConfig("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "KSFO", "America/Los_Angeles", nws_bias_f=-1.0),
     "Dallas": CityConfig("Dallas", "KXHIGHTDAL", 32.7767, -96.7970, "KDAL", "America/Chicago", nws_bias_f=-1.5),
@@ -81,6 +87,8 @@ CITIES: dict[str, CityConfig] = {
     "Boston": CityConfig("Boston", "KXHIGHTBOS", 42.3601, -71.0589, "KBOS", "America/New_York", nws_bias_f=-1.5),
     "Washington DC": CityConfig("Washington DC", "KXHIGHTDC", 38.9072, -77.0369, "KDCA", "America/New_York", nws_bias_f=-1.5),
 }
+
+CITIES: dict[str, CityConfig] = {**ORIGINAL_CITIES, **EXTENDED_CITIES}
 
 
 class WeatherClient:
@@ -117,8 +125,15 @@ class WeatherClient:
         self._api_semaphore = threading.Semaphore(int(os.getenv("OPEN_METEO_MAX_CONCURRENT", "3")))
 
     def watched_cities(self) -> list[CityConfig]:
-        """Return the exact city list requested for scanning."""
-        return list(CITIES.values())
+        """Return the city list to scan, controlled by the CITY_COUNT env flag.
+
+        CITY_COUNT=5 (default) scans only the original 5 cities to stay within
+        Open-Meteo's free-tier rate limit. CITY_COUNT=13 enables all cities.
+        """
+        city_count = int(os.getenv("CITY_COUNT", "5"))
+        if city_count >= len(CITIES):
+            return list(CITIES.values())
+        return list(CITIES.values())[:city_count]
 
     def watched_series_tickers(self) -> list[str]:
         """Return all KXHIGH, KXLOW, and KXLOWT series tickers watched by the bot."""
