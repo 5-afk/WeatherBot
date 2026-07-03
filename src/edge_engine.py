@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from src.kalshi_client import KalshiMarket
-from src.weather_client import EnsembleForecast, NwsForecast
+from src.weather_client import NwsForecast
+
+
+def estimate_probability(forecast_temp_f: float, threshold_f: float, market_type: str) -> float:
+    """Estimate YES probability from NWS forecast using a normal CDF (sigma=3.5°F)."""
+    sigma = float(os.getenv("NWS_FORECAST_SIGMA_F", "3.5"))
+    z = (threshold_f - forecast_temp_f) / (sigma * math.sqrt(2))
+    cdf_below = 0.5 * (1 + math.erf(z))
+    prob = cdf_below if market_type.lower() == "low" else (1 - cdf_below)
+    return round(float(prob), 4)
 
 
 @dataclass(frozen=True)
@@ -26,12 +36,11 @@ class EdgeDecision:
     reason: str
     market_type: str
     threshold_f: float | None
-    gfs_probability_yes: float | None
-    nws_adjusted_temperature_f: float | None
+    nws_probability_yes: float | None
+    nws_forecast_temperature_f: float | None
     hours_until_settlement: float | None
     buffer_score: float = 0.5
     observation_score: float = 0.5
-    icon_probability_yes: float | None = None
     ladder_multiplier: float = 1.0
     signal_score: float = 0.5
     ev: float | None = None
@@ -46,12 +55,10 @@ class EdgeEngine:
     MAX_HOURS_UNTIL_SETTLEMENT = 36
 
     # Signal score weights (must sum to 1.0)
-    WEIGHT_BUFFER = 0.25
-    WEIGHT_OBSERVATION = 0.15
-    WEIGHT_CONFIDENCE = 0.20
-    WEIGHT_MODEL_AGREEMENT = 0.15
-    WEIGHT_EV = 0.15
-    WEIGHT_IMBALANCE = 0.10
+    WEIGHT_BUFFER = 0.35
+    WEIGHT_OBSERVATION = 0.20
+    WEIGHT_CONFIDENCE = 0.25
+    WEIGHT_EV = 0.20
 
     def __init__(self) -> None:
         """Read edge-engine thresholds from environment variables."""
@@ -60,20 +67,13 @@ class EdgeEngine:
         self.min_ev_per_contract = float(os.getenv("MIN_EV_PER_CONTRACT", "0.05"))
         self.denver_min_edge = float(os.getenv("DENVER_MIN_EDGE", "0.15"))
         self.settlement_window_hours = float(os.getenv("SETTLEMENT_WINDOW_HOURS", "36"))
-        self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
-        self.expected_members = {
-            "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
-            "icon": int(os.getenv("EXPECTED_ICON_MEMBERS", "40")),
-        }
         logging.info("EdgeEngine MIN_EV_PER_CONTRACT=%.4f", self.min_ev_per_contract)
 
     def evaluate(
         self,
         market: KalshiMarket,
         *,
-        gfs: EnsembleForecast,
         nws: NwsForecast,
-        icon: EnsembleForecast | None = None,
         current_temp_f: float | None = None,
         ladder_multiplier: float = 1.0,
         imbalance_score: float = 0.5,
@@ -94,26 +94,20 @@ class EdgeEngine:
                 hours_until_settlement,
             )
 
-        member_problem = self._member_count_problem(gfs, icon)
-        if member_problem:
-            return self._skip(member_problem, market_type, threshold, hours_until_settlement)
+        nws_temp = nws.temperature_f
+        if nws_temp is None:
+            return self._skip("NWS gridded forecast unavailable.", market_type, threshold, hours_until_settlement)
 
-        gfs_yes = self._probability_yes(gfs.member_temperatures_f, threshold, market_type)
-        icon_yes = self._probability_yes(icon.member_temperatures_f, threshold, market_type) if icon else None
-        if gfs_yes is None or icon_yes is None:
-            return self._skip("No ensemble members matched the settlement date.", market_type, threshold, hours_until_settlement)
-
-        nws_adjusted = self._adjust_nws_temperature(nws.temperature_f, market_type, settlement_time)
+        nws_probability_yes = estimate_probability(nws_temp, threshold, market_type)
 
         yes_decision = self._evaluate_side(
             market,
             side="yes",
-            gfs_yes=gfs_yes,
-            icon_yes=icon_yes,
+            nws_probability_yes=nws_probability_yes,
+            nws_temp=nws_temp,
             threshold=threshold,
             market_type=market_type,
             hours_until_settlement=hours_until_settlement,
-            nws_adjusted=nws_adjusted,
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
@@ -121,12 +115,11 @@ class EdgeEngine:
         no_decision = self._evaluate_side(
             market,
             side="no",
-            gfs_yes=gfs_yes,
-            icon_yes=icon_yes,
+            nws_probability_yes=nws_probability_yes,
+            nws_temp=nws_temp,
             threshold=threshold,
             market_type=market_type,
             hours_until_settlement=hours_until_settlement,
-            nws_adjusted=nws_adjusted,
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
@@ -136,7 +129,6 @@ class EdgeEngine:
         if passing:
             return max(passing, key=lambda d: d.ev or -999.0)
 
-        # Neither side passes — return the skip with higher EV for logging context
         candidates = [yes_decision, no_decision]
         return max(candidates, key=lambda d: d.ev if d.ev is not None else -999.0)
 
@@ -145,12 +137,11 @@ class EdgeEngine:
         market: KalshiMarket,
         *,
         side: str,
-        gfs_yes: float,
-        icon_yes: float,
+        nws_probability_yes: float,
+        nws_temp: float,
         threshold: float,
         market_type: str,
         hours_until_settlement: float,
-        nws_adjusted: float | None,
         current_temp_f: float | None,
         ladder_multiplier: float,
         imbalance_score: float,
@@ -173,8 +164,8 @@ class EdgeEngine:
                 hours_until_settlement,
                 side=side,
                 ask_price=ask_price,
-                gfs_yes=gfs_yes,
-                icon_yes=icon_yes,
+                nws_probability_yes=nws_probability_yes,
+                nws_temp=nws_temp,
             )
         if ask_price < 0.05 and hours_until_settlement < 6:
             return self._skip(
@@ -184,8 +175,8 @@ class EdgeEngine:
                 hours_until_settlement,
                 side=side,
                 ask_price=ask_price,
-                gfs_yes=gfs_yes,
-                icon_yes=icon_yes,
+                nws_probability_yes=nws_probability_yes,
+                nws_temp=nws_temp,
             )
         if not self._check_liquidity(market, side):
             return self._skip(
@@ -195,12 +186,12 @@ class EdgeEngine:
                 hours_until_settlement,
                 side=side,
                 ask_price=ask_price,
-                gfs_yes=gfs_yes,
-                icon_yes=icon_yes,
+                nws_probability_yes=nws_probability_yes,
+                nws_temp=nws_temp,
                 ladder_multiplier=ladder_multiplier,
             )
 
-        buffer_score = self._temperature_buffer_score(nws_adjusted, threshold, market_type, side)
+        buffer_score = self._temperature_buffer_score(nws_temp, threshold, market_type, side)
         if buffer_score == 0.0:
             return EdgeDecision(
                 False,
@@ -209,24 +200,21 @@ class EdgeEngine:
                 self.limit_price(side, ask_price),
                 None,
                 None,
-                self._confidence_for_side(gfs_yes, icon_yes, side),
+                self._confidence_for_side(nws_probability_yes, side),
                 "Temperature buffer is on the wrong side of threshold.",
                 market_type,
                 threshold,
-                gfs_yes,
-                nws_adjusted,
+                nws_probability_yes,
+                nws_temp,
                 hours_until_settlement,
                 buffer_score,
                 0.5,
-                icon_yes,
                 ladder_multiplier,
                 0.0,
                 None,
                 imbalance_score,
             )
-        if nws_adjusted is None:
-            logging.info("NWS unavailable for %s — proceeding with ensemble only.", market.ticker)
-        elif not self._nws_agrees(nws_adjusted, threshold, market_type, side):
+        if not self._nws_agrees(nws_temp, threshold, market_type, side):
             return EdgeDecision(
                 False,
                 side,
@@ -234,23 +222,22 @@ class EdgeEngine:
                 self.limit_price(side, ask_price),
                 None,
                 None,
-                self._confidence_for_side(gfs_yes, icon_yes, side),
-                "NWS forecast contradicts the ensemble direction.",
+                self._confidence_for_side(nws_probability_yes, side),
+                "NWS forecast contradicts the proposed side.",
                 market_type,
                 threshold,
-                gfs_yes,
-                nws_adjusted,
+                nws_probability_yes,
+                nws_temp,
                 hours_until_settlement,
                 buffer_score,
                 0.5,
-                icon_yes,
                 ladder_multiplier,
                 0.0,
                 None,
                 imbalance_score,
             )
 
-        model_probability = self._model_probability_for_side(gfs_yes, icon_yes, side)
+        model_probability = self._model_probability_for_side(nws_probability_yes, side)
         ev = self._calculate_ev(model_probability, ask_price)
         if ev < self.min_ev_per_contract:
             return self._skip(
@@ -260,14 +247,14 @@ class EdgeEngine:
                 hours_until_settlement,
                 side=side,
                 ask_price=ask_price,
-                gfs_yes=gfs_yes,
-                icon_yes=icon_yes,
+                nws_probability_yes=nws_probability_yes,
+                nws_temp=nws_temp,
                 ev=ev,
                 imbalance_score=imbalance_score,
             )
 
         edge = model_probability - ask_price
-        confidence = self._confidence_for_side(gfs_yes, icon_yes, side)
+        confidence = self._confidence_for_side(nws_probability_yes, side)
 
         required_edge = self._required_edge(market)
         if buffer_score == 0.1:
@@ -279,14 +266,11 @@ class EdgeEngine:
             side,
             hours_until_settlement,
         )
-        model_agreement = self._model_agreement(gfs_yes, icon_yes)
         signal_score = self._combined_signal_score(
             buffer_score,
             observation_score,
             confidence,
             ev,
-            model_agreement,
-            imbalance_score,
         )
         pre_claude_decision = EdgeDecision(
             False,
@@ -299,12 +283,11 @@ class EdgeEngine:
             "",
             market_type,
             threshold,
-            gfs_yes,
-            nws_adjusted,
+            nws_probability_yes,
+            nws_temp,
             hours_until_settlement,
             buffer_score,
             observation_score,
-            icon_yes,
             ladder_multiplier,
             signal_score,
             ev,
@@ -323,12 +306,11 @@ class EdgeEngine:
                 f"Pre-Claude gate failed: {pre_claude_reason}",
                 market_type,
                 threshold,
-                gfs_yes,
-                nws_adjusted,
+                nws_probability_yes,
+                nws_temp,
                 hours_until_settlement,
                 buffer_score,
                 observation_score,
-                icon_yes,
                 ladder_multiplier,
                 signal_score,
                 ev,
@@ -347,12 +329,11 @@ class EdgeEngine:
                 f"Edge {edge:.1%} is below required {required_edge:.1%} threshold.",
                 market_type,
                 threshold,
-                gfs_yes,
-                nws_adjusted,
+                nws_probability_yes,
+                nws_temp,
                 hours_until_settlement,
                 buffer_score,
                 observation_score,
-                icon_yes,
                 ladder_multiplier,
                 signal_score,
                 ev,
@@ -366,15 +347,14 @@ class EdgeEngine:
             model_probability,
             edge,
             confidence,
-            "Strong ensemble agreement with NWS confirmation.",
+            "Strong NWS gridded forecast with favorable buffer.",
             market_type,
             threshold,
-            gfs_yes,
-            nws_adjusted,
+            nws_probability_yes,
+            nws_temp,
             hours_until_settlement,
             buffer_score,
             observation_score,
-            icon_yes,
             ladder_multiplier,
             signal_score,
             ev,
@@ -532,18 +512,12 @@ class EdgeEngine:
         ev = (model_probability * profit_if_win) - ((1 - model_probability) * loss_if_lose)
         return round(ev, 4)
 
-    def _model_agreement(self, gfs_yes: float, icon_yes: float) -> float:
-        """Return 2-model directional agreement: 1.0 if GFS and ICON agree, else 0.0."""
-        return 1.0 if (gfs_yes >= 0.5) == (icon_yes >= 0.5) else 0.0
-
     def _combined_signal_score(
         self,
         buffer_score: float,
         observation_score: float,
         confidence: float,
         ev: float,
-        model_agreement: float,
-        imbalance_score: float = 0.5,
     ) -> float:
         """Return the weighted combined signal score used before Claude."""
         ev_score = min(1.0, max(0.0, ev / 0.20))
@@ -551,26 +525,22 @@ class EdgeEngine:
             "buffer": buffer_score * self.WEIGHT_BUFFER,
             "obs": observation_score * self.WEIGHT_OBSERVATION,
             "conf": confidence * self.WEIGHT_CONFIDENCE,
-            "agree": model_agreement * self.WEIGHT_MODEL_AGREEMENT,
             "ev": ev_score * self.WEIGHT_EV,
-            "imb": imbalance_score * self.WEIGHT_IMBALANCE,
         }
         weights_sum = (
-            self.WEIGHT_BUFFER + self.WEIGHT_OBSERVATION + self.WEIGHT_CONFIDENCE
-            + self.WEIGHT_MODEL_AGREEMENT + self.WEIGHT_EV + self.WEIGHT_IMBALANCE
+            self.WEIGHT_BUFFER + self.WEIGHT_OBSERVATION
+            + self.WEIGHT_CONFIDENCE + self.WEIGHT_EV
         )
         signal_score = round(min(sum(contributions.values()), 1.0), 3)
         logging.debug(
             "signal components ev=%.3f ev_score=%.3f | buffer=%.3f obs=%.3f conf=%.3f "
-            "agree=%.3f ev=%.3f imb=%.3f | weights_sum=%.2f => signal=%.3f",
+            "ev=%.3f | weights_sum=%.2f => signal=%.3f",
             ev,
             ev_score,
             contributions["buffer"],
             contributions["obs"],
             contributions["conf"],
-            contributions["agree"],
             contributions["ev"],
-            contributions["imb"],
             weights_sum,
             signal_score,
         )
@@ -581,45 +551,13 @@ class EdgeEngine:
         ticker_text = f"{market.series_ticker} {market.ticker}".upper()
         return self.denver_min_edge if "DEN" in ticker_text else self.min_edge
 
-    def _member_count_problem(self, gfs: EnsembleForecast, icon: EnsembleForecast | None) -> str | None:
-        """Verify Open-Meteo returned the requested member ensembles."""
-        if gfs.member_count < self.expected_members["gfs"]:
-            return f"GFS returned {gfs.member_count} members, expected {self.expected_members['gfs']}."
-        if icon is None or icon.member_count < self.expected_members["icon"]:
-            icon_count = icon.member_count if icon else 0
-            return f"ICON returned {icon_count} members, expected {self.expected_members['icon']}."
-        return None
+    def _model_probability_for_side(self, nws_probability_yes: float, side: str) -> float:
+        """Return model probability for the proposed side."""
+        return nws_probability_yes if side == "yes" else 1 - nws_probability_yes
 
-    def _probability_yes(self, values: list[float], threshold: float, market_type: str) -> float | None:
-        """Count the fraction of ensemble members that make YES correct."""
-        if not values:
-            return None
-        if market_type == "high":
-            winning_members = sum(1 for value in values if value > threshold)
-        else:
-            winning_members = sum(1 for value in values if value < threshold)
-        return winning_members / len(values)
-
-    def _model_probability_for_side(self, gfs_yes: float, icon_yes: float, side: str) -> float:
-        """Average GFS and ICON probability for the proposed side."""
-        probability_yes = (gfs_yes + icon_yes) / 2
-        return probability_yes if side == "yes" else 1 - probability_yes
-
-    def _confidence_for_side(self, gfs_yes: float, icon_yes: float, side: str) -> float:
-        """Use the weaker model's side probability as the confidence score."""
-        if side == "yes":
-            return min(gfs_yes, icon_yes)
-        return min(1 - gfs_yes, 1 - icon_yes)
-
-    def _adjust_nws_temperature(
-        self,
-        temperature_f: float | None,
-        market_type: str,
-        settlement_time: datetime | None,
-    ) -> float | None:
-        """Return NWS temperature; bias correction is applied in WeatherClient.get_nws_forecast."""
-        del market_type, settlement_time
-        return temperature_f
+    def _confidence_for_side(self, nws_probability_yes: float, side: str) -> float:
+        """Use the side's probability as confidence (larger buffer -> further from 0.5)."""
+        return nws_probability_yes if side == "yes" else 1 - nws_probability_yes
 
     def _nws_agrees(self, temperature_f: float | None, threshold: float, market_type: str, side: str) -> bool:
         """Return True when NWS points in the same YES/NO direction."""
@@ -637,8 +575,8 @@ class EdgeEngine:
         *,
         side: str | None = None,
         ask_price: float | None = None,
-        gfs_yes: float | None = None,
-        icon_yes: float | None = None,
+        nws_probability_yes: float | None = None,
+        nws_temp: float | None = None,
         ladder_multiplier: float = 1.0,
         ev: float | None = None,
         imbalance_score: float = 0.5,
@@ -655,12 +593,11 @@ class EdgeEngine:
             reason,
             market_type,
             threshold,
-            gfs_yes,
-            None,
+            nws_probability_yes,
+            nws_temp,
             hours_until_settlement,
             0.5,
             0.5,
-            icon_yes,
             ladder_multiplier,
             0.5,
             ev,

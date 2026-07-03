@@ -43,10 +43,10 @@ class ClaudeChecker:
         "Observation score measures live temperature alignment — above 0.9 is near-certain. "
         "Respond with ONLY raw JSON, no markdown, no code fences: "
         "{\"decision\": \"GO\" or \"NOGO\", \"reason\": \"one sentence\"}. "
-        "Approve ONLY when: both models strongly agree (>75% confidence), "
-        "NWS confirms direction, zero severe alerts active, "
+        "Approve ONLY when: the NWS gridded forecast strongly favors the outcome "
+        "(model probability > 75%), NWS confirms direction, zero severe alerts active, "
         "current conditions support forecast, and edge exceeds 15%. "
-        "Reject if: ANY severe alert active, models below 75% agreement, "
+        "Reject if: ANY severe alert active, NWS model probability below 75%, "
         "web context shows unusual weather, or edge is borderline."
     )
 

@@ -1,14 +1,14 @@
-"""Weather API client for Open-Meteo ensembles and NWS forecasts."""
+"""Weather API client for NWS gridded forecasts and station observations."""
 
 from __future__ import annotations
 
 import logging
 import os
 import threading
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -48,25 +48,15 @@ class CityConfig:
 
 
 @dataclass(frozen=True)
-class EnsembleForecast:
-    """Daily high/low values from one weather ensemble model."""
-
-    model_name: str
-    member_temperatures_f: list[float]
-    expected_temperature_f: float | None
-    member_count: int
-
-
-@dataclass(frozen=True)
 class NwsForecast:
-    """NWS official forecast period matched to the market settlement date."""
+    """NWS gridded hourly forecast matched to the market settlement date."""
 
     temperature_f: float | None
     short_forecast: str
     source: str
 
 
-# Original 5 cities — always scanned. Kept first so CITY_COUNT=5 selects exactly these.
+# Original 5 cities — kept first so CITY_COUNT=5 selects exactly these.
 ORIGINAL_CITIES: dict[str, CityConfig] = {
     "New York": CityConfig("New York", "KXHIGHNY", 40.7128, -74.0060, "KNYC", "America/New_York", nws_bias_f=-1.5),
     "Chicago": CityConfig("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "KMDW", "America/Chicago", nws_bias_f=-1.5),
@@ -75,8 +65,7 @@ ORIGINAL_CITIES: dict[str, CityConfig] = {
     "Denver": CityConfig("Denver", "KXHIGHDEN", 39.7392, -104.9903, "KDEN", "America/Denver", nws_bias_f=-1.5),
 }
 
-# 8 expansion cities — enabled only when CITY_COUNT >= 13. Temporarily disabled by
-# default (CITY_COUNT=5) to stay within Open-Meteo's free-tier rate limit.
+# 8 expansion cities — enabled when CITY_COUNT >= 13.
 EXTENDED_CITIES: dict[str, CityConfig] = {
     "Seattle": CityConfig("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "KSEA", "America/Los_Angeles", nws_bias_f=-1.0),
     "San Francisco": CityConfig("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "KSFO", "America/Los_Angeles", nws_bias_f=-1.0),
@@ -92,9 +81,8 @@ CITIES: dict[str, CityConfig] = {**ORIGINAL_CITIES, **EXTENDED_CITIES}
 
 
 class WeatherClient:
-    """Fetch and normalize weather data from free public APIs."""
+    """Fetch and normalize weather data from free NWS public APIs."""
 
-    OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
     NWS_BASE_URL = "https://api.weather.gov"
 
     def __init__(self) -> None:
@@ -102,33 +90,23 @@ class WeatherClient:
         self.session = requests.Session()
         self.timeout_seconds = 25
         self.nws_user_agent = os.getenv("NWS_USER_AGENT", "kalshi-weather-bot/1.0")
-        self.model_names = {
-            "gfs": os.getenv("OPEN_METEO_GFS_MODEL", "gfs_seamless"),
-            "icon": os.getenv("OPEN_METEO_ICON_MODEL", "icon_seamless"),
-        }
         self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
         self.nws_low_bias_f = float(os.getenv("NWS_SUMMER_LOW_BIAS_F", "1.0"))
-        self.expected_members = {
-            "gfs": int(os.getenv("EXPECTED_GFS_MEMBERS", "31")),
-            "icon": int(os.getenv("EXPECTED_ICON_MEMBERS", "40")),
-        }
-        # Cache at (city, model, date) level — one fetch yields both HIGH and LOW
-        # member distributions, so KXHIGH/KXLOW/KXLOWT markets reuse the same call.
-        self._cache: dict[tuple[str, str, str], tuple[dict[str, EnsembleForecast], datetime]] = {}
-        cache_ttl_minutes = int(os.getenv("OPEN_METEO_CACHE_TTL_MINUTES", "60"))
+        # Per-city gridpoint coordinates (office, gridX, gridY) — never change.
+        self._gridpoint_cache: dict[str, tuple[str, int, int]] = {}
+        # Hourly forecast bundle per (city, date): {"high": NwsForecast, "low": NwsForecast}
+        self._forecast_cache: dict[tuple[str, str], tuple[dict[str, NwsForecast], datetime]] = {}
+        cache_ttl_minutes = int(os.getenv("NWS_FORECAST_CACHE_TTL_MINUTES", "60"))
         self._cache_ttl = timedelta(minutes=cache_ttl_minutes)
         self._cache_lock = threading.Lock()
-        # Limit concurrent Open-Meteo HTTP calls so parallel scans do not trip
-        # the free-tier rate limit all at once.
-        self._api_semaphore = threading.Semaphore(int(os.getenv("OPEN_METEO_MAX_CONCURRENT", "3")))
 
     def watched_cities(self) -> list[CityConfig]:
         """Return the city list to scan, controlled by the CITY_COUNT env flag.
 
-        CITY_COUNT=5 (default) scans only the original 5 cities to stay within
-        Open-Meteo's free-tier rate limit. CITY_COUNT=13 enables all cities.
+        CITY_COUNT=13 (default) scans all cities. Set CITY_COUNT=5 to scan only
+        the original five cities.
         """
-        city_count = int(os.getenv("CITY_COUNT", "5"))
+        city_count = int(os.getenv("CITY_COUNT", "13"))
         if city_count >= len(CITIES):
             return list(CITIES.values())
         return list(CITIES.values())[:city_count]
@@ -148,189 +126,137 @@ class WeatherClient:
                 return city
         return None
 
-    def prewarm_cache(self, cities: list[CityConfig], target_date: date) -> None:
-        """Pre-fetch all ensemble data sequentially before market evaluation begins.
-
-        Fills the (city, model, date) cache once per scan cycle with staggered
-        delays (5s initial cooldown, 2.0s between models, 4.0s between cities)
-        so the parallel evaluation phase hits cache instead of hammering Open-Meteo.
-        A 429 is logged and skipped (no aggressive retry); affected cities fall back
-        to GFS-only for this cycle.
-        """
-        logging.info("Prewarming cache — waiting 5s before first fetch...")
-        time.sleep(5.0)
-        for city in cities:
-            for model_key in ("gfs", "icon"):
-                self.get_ensemble_forecast(city, model_key, target_date, "high", allow_fetch=True)
-                time.sleep(2.0)
-            time.sleep(4.0)
-
-    def get_ensemble_forecast(
+    def get_nws_gridded_forecast(
         self,
         city: CityConfig,
-        model_key: str,
         target_date: date,
         market_type: str,
-        allow_fetch: bool = False,
-    ) -> EnsembleForecast:
-        """Return a GFS or ICON ensemble reduced to daily highs/lows.
+    ) -> NwsForecast:
+        """Return NWS gridded hourly forecast high/low for the target date.
 
-        Caches both the HIGH and LOW member distributions per (city, model, date)
-        so HIGH and LOW markets for the same city reuse a single API call.
-
-        API calls happen ONLY when ``allow_fetch=True`` (prewarm_cache). In the
-        evaluation path (``allow_fetch=False``, the default) a cache hit is
-        returned and a cache miss returns an empty forecast immediately with zero
-        network calls — making it impossible for evaluation threads to hit the API
-        or stall on rate limits. On a 429 (or any error) during prewarm we log and
-        return an empty forecast: no retry, no backoff, no sleeping.
+        One hourly API call per (city, date) yields both HIGH and LOW forecasts.
+        HIGH = max temp 12:00-18:00 local; LOW = min temp 00:00-08:00 local.
+        Summer bias correction is applied before caching.
         """
-        model_name = self.model_names[model_key]
-        cache_key = (city.name, model_key, str(target_date))
         want = "high" if market_type == "high" else "low"
-        empty = EnsembleForecast(model_name, [], None, 0)
+        cache_key = (city.name, str(target_date))
         with self._cache_lock:
-            cached = self._cache.get(cache_key)
+            cached = self._forecast_cache.get(cache_key)
             if cached is not None:
                 bundle, expires_at = cached
                 if datetime.now() < expires_at:
                     return bundle[want]
 
-        if not allow_fetch:
-            logging.debug(
-                "Cache miss for %s %s — prewarm did not cover this key; returning empty.",
-                city.name,
-                model_key,
-            )
-            return empty
+        bundle = self._fetch_gridded_bundle(city, target_date)
+        with self._cache_lock:
+            self._forecast_cache[cache_key] = (bundle, datetime.now() + self._cache_ttl)
+        return bundle[want]
 
-        params = {
-            "latitude": city.lat,
-            "longitude": city.lon,
-            "hourly": "temperature_2m",
-            "temperature_unit": "fahrenheit",
-            "forecast_days": 3,
-            "models": model_name,
-        }
-        try:
-            with self._api_semaphore:
-                response = self.session.get(
-                    self.OPEN_METEO_ENSEMBLE_URL,
-                    params=params,
-                    timeout=30,
-                )
-            if response.status_code == 429:
-                logging.warning(
-                    "Open-Meteo rate limited for %s %s — skipping this cycle.",
-                    city.name,
-                    model_key,
-                )
-                return empty
-            response.raise_for_status()
-            bundle = self._parse_ensemble_bundle(
-                response.json(),
-                model_name=model_name,
-                model_key=model_key,
-                target_date=target_date,
-                city=city,
-            )
-            with self._cache_lock:
-                self._cache[cache_key] = (bundle, datetime.now() + self._cache_ttl)
-            return bundle[want]
-        except Exception as exc:
-            logging.warning(
-                "Ensemble forecast failed for %s %s: %s",
-                city.name,
-                model_key,
-                exc,
-            )
-            return empty
-
-    def _parse_ensemble_bundle(
-        self,
-        payload: dict[str, Any],
-        *,
-        model_name: str,
-        model_key: str,
-        target_date: date,
-        city: CityConfig,
-    ) -> dict[str, EnsembleForecast]:
-        """Parse Open-Meteo ensemble JSON into both HIGH and LOW member distributions."""
-        hourly = payload.get("hourly", {})
-        times = hourly.get("time", [])
-        member_series = self._extract_temperature_members(hourly)
-
-        high_values: list[float] = []
-        low_values: list[float] = []
-        for values in member_series:
-            high_value = self._daily_high_or_low(times, values, target_date, "high")
-            low_value = self._daily_high_or_low(times, values, target_date, "low")
-            if high_value is not None:
-                high_values.append(high_value)
-            if low_value is not None:
-                low_values.append(low_value)
-
-        return {
-            "high": self._build_forecast(model_name, model_key, city, high_values),
-            "low": self._build_forecast(model_name, model_key, city, low_values),
-        }
-
-    def _build_forecast(
-        self,
-        model_name: str,
-        model_key: str,
-        city: CityConfig,
-        daily_values: list[float],
-    ) -> EnsembleForecast:
-        """Build an EnsembleForecast and warn when member count is below expected."""
-        member_count = len(daily_values)
-        expected = self.expected_members.get(model_key)
-        if expected is not None and member_count < expected:
-            logging.warning(
-                "%s returned %d members for %s, expected %d.",
-                model_key.upper(),
-                member_count,
-                city.name,
-                expected,
-            )
-        mean_temp = round(sum(daily_values) / member_count, 2) if daily_values else None
-        return EnsembleForecast(model_name, daily_values, mean_temp, member_count)
-
-    def get_nws_forecast(self, city: CityConfig, target_date: date, market_type: str) -> NwsForecast:
-        """Fetch the official NWS point forecast for the settlement station area."""
+    def _fetch_gridded_bundle(self, city: CityConfig, target_date: date) -> dict[str, NwsForecast]:
+        """Fetch hourly forecast and build HIGH/LOW NwsForecast bundle."""
+        empty_high = NwsForecast(None, "NWS gridded fetch failed", city.nws_station)
+        empty_low = NwsForecast(None, "NWS gridded fetch failed", city.nws_station)
         headers = {"User-Agent": self.nws_user_agent, "Accept": "application/geo+json"}
         try:
-            point_url = f"{self.NWS_BASE_URL}/points/{city.lat:.4f},{city.lon:.4f}"
-            point_response = self.session.get(point_url, headers=headers, timeout=self.timeout_seconds)
-            point_response.raise_for_status()
-            forecast_url = point_response.json()["properties"]["forecast"]
+            office, grid_x, grid_y = self._resolve_gridpoint(city, headers)
+            url = f"{self.NWS_BASE_URL}/gridpoints/{office}/{grid_x},{grid_y}/forecast/hourly"
+            response = self.session.get(url, headers=headers, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            periods = response.json().get("properties", {}).get("periods", [])
+            return self._build_bundle_from_periods(city, target_date, periods)
+        except Exception as exc:
+            logging.warning("NWS gridded forecast failed for %s: %s", city.name, exc)
+            return {"high": empty_high, "low": empty_low}
 
-            forecast_response = self.session.get(forecast_url, headers=headers, timeout=self.timeout_seconds)
-            forecast_response.raise_for_status()
-            periods = forecast_response.json()["properties"].get("periods", [])
-            period = self._select_nws_period(periods, target_date, market_type)
-            if not period:
-                return NwsForecast(None, "No matching NWS forecast period", city.nws_station)
+    def _resolve_gridpoint(self, city: CityConfig, headers: dict[str, str]) -> tuple[str, int, int]:
+        """Return (office, gridX, gridY) for a city, caching forever after first lookup."""
+        with self._cache_lock:
+            cached = self._gridpoint_cache.get(city.name)
+            if cached is not None:
+                return cached
 
-            temperature = self._safe_float(period.get("temperature"))
-            if temperature is not None and target_date.month in {6, 7, 8}:
-                if market_type == "high":
-                    # NWS warm bias for HIGH markets in summer — subtract correction
-                    bias = abs(city.nws_bias_f) if city.nws_bias_f else self.nws_warm_bias_f
-                    temperature = round(temperature - bias, 2)
-                elif market_type == "low":
-                    # LOW forecasts underestimated in summer — add correction
-                    low_bias = city.nws_low_bias_f if city.nws_low_bias_f else self.nws_low_bias_f
-                    temperature = round(temperature + low_bias, 2)
+        point_url = f"{self.NWS_BASE_URL}/points/{city.lat:.4f},{city.lon:.4f}"
+        response = self.session.get(point_url, headers=headers, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        props = response.json()["properties"]
+        gridpoint = (str(props["gridId"]), int(props["gridX"]), int(props["gridY"]))
+        with self._cache_lock:
+            self._gridpoint_cache[city.name] = gridpoint
+        return gridpoint
 
-            return NwsForecast(
-                temperature,
-                str(period.get("shortForecast", "")),
-                f"{city.nws_station} via NWS point forecast",
-            )
-        except requests.RequestException as exc:
-            logging.warning("NWS forecast failed for %s: %s", city.nws_station, exc)
-            return NwsForecast(None, "NWS fetch failed", city.nws_station)
+    def _build_bundle_from_periods(
+        self,
+        city: CityConfig,
+        target_date: date,
+        periods: list[dict[str, Any]],
+    ) -> dict[str, NwsForecast]:
+        """Parse hourly periods into HIGH and LOW NwsForecast objects."""
+        tz = ZoneInfo(city.tz)
+        high_temps: list[float] = []
+        low_temps: list[float] = []
+        all_day_temps: list[float] = []
+        high_short = ""
+        low_short = ""
+
+        for period in periods:
+            start_time = period.get("startTime")
+            if not start_time:
+                continue
+            try:
+                local_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00")).astimezone(tz)
+            except ValueError:
+                continue
+            if local_dt.date() != target_date:
+                continue
+            temp = self._safe_float(period.get("temperature"))
+            if temp is None:
+                continue
+            all_day_temps.append(temp)
+            hour = local_dt.hour
+            short = str(period.get("shortForecast", ""))
+            if 12 <= hour <= 18:
+                high_temps.append(temp)
+                if not high_short:
+                    high_short = short
+            if 0 <= hour <= 8:
+                low_temps.append(temp)
+                if not low_short:
+                    low_short = short
+
+        high_raw = max(high_temps) if high_temps else (max(all_day_temps) if all_day_temps else None)
+        low_raw = min(low_temps) if low_temps else (min(all_day_temps) if all_day_temps else None)
+
+        high_temp = self._apply_bias(high_raw, city, target_date, "high")
+        low_temp = self._apply_bias(low_raw, city, target_date, "low")
+
+        return {
+            "high": NwsForecast(
+                high_temp,
+                high_short or "NWS gridded hourly",
+                f"{city.nws_station} via NWS gridded hourly",
+            ),
+            "low": NwsForecast(
+                low_temp,
+                low_short or "NWS gridded hourly",
+                f"{city.nws_station} via NWS gridded hourly",
+            ),
+        }
+
+    def _apply_bias(
+        self,
+        temperature: float | None,
+        city: CityConfig,
+        target_date: date,
+        market_type: str,
+    ) -> float | None:
+        """Apply summer bias correction to raw NWS temperature."""
+        if temperature is None or target_date.month not in {6, 7, 8}:
+            return temperature
+        if market_type == "high":
+            bias = abs(city.nws_bias_f) if city.nws_bias_f else self.nws_warm_bias_f
+            return round(temperature - bias, 2)
+        low_bias = city.nws_low_bias_f if city.nws_low_bias_f else self.nws_low_bias_f
+        return round(temperature + low_bias, 2)
 
     def latest_station_observation(self, city: CityConfig) -> dict[str, Any] | None:
         """Fetch the latest station observation for debugging and audit logs."""
@@ -343,59 +269,6 @@ class WeatherClient:
         except requests.RequestException as exc:
             logging.warning("NWS station observation failed for %s: %s", city.nws_station, exc)
             return None
-
-    def _extract_temperature_members(self, hourly: dict[str, Any]) -> list[list[float | None]]:
-        """Extract ensemble member arrays from Open-Meteo's hourly object."""
-        members: list[list[float | None]] = []
-        for key, value in hourly.items():
-            if key == "time" or not isinstance(value, list):
-                continue
-            if key.startswith("temperature_2m"):
-                members.append(value)
-        return members
-
-    def _daily_high_or_low(
-        self,
-        times: list[str],
-        values: list[float | None],
-        target_date: date,
-        market_type: str,
-    ) -> float | None:
-        """Return a member's high or low temperature for the target date."""
-        temperatures: list[float] = []
-        for timestamp, value in zip(times, values):
-            if value is None:
-                continue
-            try:
-                local_date = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).date()
-            except ValueError:
-                continue
-            if local_date == target_date:
-                temperatures.append(float(value))
-
-        if not temperatures:
-            return None
-        return max(temperatures) if market_type == "high" else min(temperatures)
-
-    def _select_nws_period(
-        self,
-        periods: list[dict[str, Any]],
-        target_date: date,
-        market_type: str,
-    ) -> dict[str, Any] | None:
-        """Pick daytime periods for highs and nighttime periods for lows."""
-        wants_daytime = market_type == "high"
-        for period in periods:
-            start_time = period.get("startTime")
-            if not start_time:
-                continue
-            try:
-                period_date = datetime.fromisoformat(str(start_time).replace("Z", "+00:00")).date()
-            except ValueError:
-                continue
-            if period_date == target_date and bool(period.get("isDaytime")) == wants_daytime:
-                return period
-        return None
 
     @staticmethod
     def _safe_float(value: Any) -> float | None:

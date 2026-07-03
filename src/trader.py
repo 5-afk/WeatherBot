@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ from src.edge_engine import EdgeDecision, EdgeEngine
 from src.kalshi_client import KalshiClient, KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
 from src.risk_manager import RiskManager
-from src.weather_client import CityConfig, EnsembleForecast, NwsForecast, WeatherClient
+from src.weather_client import CityConfig, NwsForecast, WeatherClient
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -117,7 +117,7 @@ class Trader:
         self._scan_bets = 0
         self._scan_skips = 0
         self._scan_signals = 0
-        self._weather_cache: dict[tuple[str, str, str], tuple[EnsembleForecast, EnsembleForecast, NwsForecast]] = {}
+        self._weather_cache: dict[tuple[str, str, str], NwsForecast] = {}
         self._observation_cache: dict[str, float | None] = {}
 
         if not self.dry_run:
@@ -155,17 +155,6 @@ class Trader:
                     [market.yes_ask for market in markets if market.yes_ask is not None]
                 )
                 market_rows.extend((city, market, ladder_multiplier) for market in markets)
-
-        # Pre-warm the ensemble cache once per scan (sequential, staggered) so the
-        # parallel evaluation phase hits cache instead of the Open-Meteo rate limit.
-        target_dates: set[date] = set()
-        for _city, market, _ladder in market_rows:
-            settlement_time = market.settlement_time or market.close_time
-            if settlement_time is not None:
-                target_dates.add(settlement_time.astimezone(timezone.utc).date())
-        cities = self.weather.watched_cities()
-        for target_date in sorted(target_dates):
-            self.weather.prewarm_cache(cities, target_date)
 
         candidates: list[tuple[CityConfig, KalshiMarket, EdgeDecision]] = []
         total_checked = len(market_rows)
@@ -274,17 +263,13 @@ class Trader:
             with self._scan_lock:
                 cached_weather = self._weather_cache.get(cache_key)
             if cached_weather is None:
-                weather_bundle = (
-                    self.weather.get_ensemble_forecast(city, "gfs", target_date, market_type),
-                    self.weather.get_ensemble_forecast(city, "icon", target_date, market_type),
-                    self.weather.get_nws_forecast(city, target_date, market_type),
-                )
+                nws = self.weather.get_nws_gridded_forecast(city, target_date, market_type)
                 with self._scan_lock:
                     if cache_key not in self._weather_cache:
-                        self._weather_cache[cache_key] = weather_bundle
-                    gfs, icon, nws = self._weather_cache[cache_key]
+                        self._weather_cache[cache_key] = nws
+                    nws = self._weather_cache[cache_key]
             else:
-                gfs, icon, nws = cached_weather
+                nws = cached_weather
         except Exception as exc:
             logging.debug("Weather fetch failed %s: %s", market.ticker, exc)
             self._log_skip(city, market, f"Weather fetch failed: {exc}", None)
@@ -294,9 +279,7 @@ class Trader:
         imbalance_score = self._fetch_imbalance(market)
         edge = self.edge_engine.evaluate(
             market,
-            gfs=gfs,
             nws=nws,
-            icon=icon,
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
@@ -386,10 +369,9 @@ class Trader:
             "observation_score": edge.observation_score,
             "imbalance_score": edge.imbalance_score,
             "confidence": round(edge.confidence * 100, 1),
-            "gfs_probability": edge.gfs_probability_yes,
-            "icon_probability": edge.icon_probability_yes,
+            "nws_probability": edge.nws_probability_yes,
+            "nws_forecast_f": edge.nws_forecast_temperature_f,
             "hours_until_settlement": edge.hours_until_settlement,
-            "nws_adjusted_f": edge.nws_adjusted_temperature_f,
             "settlement": settlement.isoformat() if settlement else None,
         }
 
@@ -637,17 +619,15 @@ class Trader:
 
     def _buffer_text(self, edge: EdgeDecision | None) -> str:
         """Format the forecast-threshold buffer for logs."""
-        if edge is None or edge.nws_adjusted_temperature_f is None or edge.threshold_f is None:
+        if edge is None or edge.nws_forecast_temperature_f is None or edge.threshold_f is None:
             return "n/a"
-        return f"{abs(edge.nws_adjusted_temperature_f - edge.threshold_f):.1f}F"
+        return f"{abs(edge.nws_forecast_temperature_f - edge.threshold_f):.1f}F"
 
     def _claude_payload(
         self,
         city: CityConfig,
         market: KalshiMarket,
         edge: EdgeDecision,
-        gfs: EnsembleForecast,
-        icon: EnsembleForecast,
         nws: NwsForecast,
         enrichment: dict[str, Any],
     ) -> dict[str, Any]:
@@ -659,12 +639,8 @@ class Trader:
             "date": settlement.isoformat() if settlement else None,
             "temperature_threshold_f": edge.threshold_f,
             "side": edge.side,
-            "gfs_probability": gfs.member_temperatures_f and edge.gfs_probability_yes,
-            "icon_probability": icon.member_temperatures_f and edge.icon_probability_yes,
-            "gfs_members": gfs.member_count,
-            "icon_members": icon.member_count,
-            "nws_forecast_f": nws.temperature_f,
-            "nws_adjusted_forecast_f": edge.nws_adjusted_temperature_f,
+            "nws_probability": edge.nws_probability_yes,
+            "nws_forecast_f": edge.nws_forecast_temperature_f,
             "nws_short_forecast": nws.short_forecast,
             "market_price": edge.ask_price,
             "limit_price": edge.limit_price,
@@ -681,7 +657,6 @@ class Trader:
             "observation_score": edge.observation_score,
             "signal_score": edge.signal_score,
             "ladder_multiplier": edge.ladder_multiplier,
-            "icon_probability_yes": edge.icon_probability_yes,
             "temperature_buffer_f": abs(
                 (nws.temperature_f or threshold) - threshold
             ) if nws.temperature_f and threshold is not None else None,

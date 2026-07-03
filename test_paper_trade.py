@@ -1,7 +1,7 @@
 """Paper-trade harness for the Kalshi weather bot.
 
 This script never calls Kalshi's order endpoint. It uses mock Kalshi markets,
-real Open-Meteo/NWS weather data, the real edge engine, the real Claude checker,
+real NWS gridded weather data, the real edge engine, the real Claude checker,
 and the real position sizer to show what the bot would do in dry-run mode.
 """
 
@@ -19,7 +19,7 @@ from src.edge_engine import EdgeDecision, EdgeEngine
 from src.kalshi_client import KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
 from src.risk_manager import RiskManager
-from src.weather_client import CityConfig, EnsembleForecast, NwsForecast, WeatherClient
+from src.weather_client import CityConfig, NwsForecast, WeatherClient
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -103,8 +103,6 @@ def claude_payload(
     city: CityConfig,
     market: KalshiMarket,
     decision: EdgeDecision,
-    gfs: EnsembleForecast,
-    icon: EnsembleForecast,
     nws: NwsForecast,
     enrichment: dict[str, object],
 ) -> dict[str, object]:
@@ -115,12 +113,8 @@ def claude_payload(
         "date": settlement.isoformat() if settlement else None,
         "temperature_threshold_f": decision.threshold_f,
         "side": decision.side,
-        "gfs_probability": decision.gfs_probability_yes,
-        "icon_probability": decision.icon_probability_yes,
-        "gfs_members": gfs.member_count,
-        "icon_members": icon.member_count,
-        "nws_forecast_f": nws.temperature_f,
-        "nws_adjusted_forecast_f": decision.nws_adjusted_temperature_f,
+        "nws_probability": decision.nws_probability_yes,
+        "nws_forecast_f": decision.nws_forecast_temperature_f,
         "nws_short_forecast": nws.short_forecast,
         "market_price": decision.ask_price,
         "limit_price": decision.limit_price,
@@ -161,10 +155,8 @@ def summarize_market(
     print(f"Market: {market.ticker}")
     print(f"City: {city.name}")
     print(f"Threshold: {fmt_temp(decision.threshold_f)}")
-    print(f"GFS probability YES: {fmt_pct(decision.gfs_probability_yes)}")
-    print(f"ICON probability YES: {fmt_pct(decision.icon_probability_yes)}")
+    print(f"NWS probability YES: {fmt_pct(decision.nws_probability_yes)}")
     print(f"NWS forecast: {fmt_temp(nws.temperature_f)} ({nws.short_forecast})")
-    print(f"Adjusted NWS forecast: {fmt_temp(decision.nws_adjusted_temperature_f)}")
     print(f"Edge: {fmt_pct(decision.edge)}")
     print(f"Confidence: {fmt_pct(decision.confidence)}")
     print(f"Current temp: {fmt_temp(enrichment.get('current_temp_f') if enrichment else None)}")
@@ -212,14 +204,12 @@ def main() -> None:
         target_date = settlement_time.astimezone(timezone.utc).date()
 
         try:
-            gfs = weather.get_ensemble_forecast(city, "gfs", target_date, market_type, allow_fetch=True)
-            icon = weather.get_ensemble_forecast(city, "icon", target_date, market_type, allow_fetch=True)
-            nws = weather.get_nws_forecast(city, target_date, market_type)
+            nws = weather.get_nws_gridded_forecast(city, target_date, market_type)
         except Exception as exc:
             print(f"\nMarket: {market.ticker}\nCity: {city.name}\nWould bet: NO\nReason: Weather fetch failed: {exc}")
             continue
 
-        decision = edge_engine.evaluate(market, gfs=gfs, icon=icon, nws=nws)
+        decision = edge_engine.evaluate(market, nws=nws)
         claude: ClaudeDecision | None = None
         size: PositionSize | None = None
         would_bet = False
@@ -227,7 +217,7 @@ def main() -> None:
 
         if decision.should_trade:
             enrichment = enricher.enrich(city, target_date.isoformat())
-            payload = claude_payload(city, market, decision, gfs, icon, nws, enrichment)
+            payload = claude_payload(city, market, decision, nws, enrichment)
             claude = claude_checker.check(payload)
             if claude.approved:
                 mock_market_price = float(raw["yes_ask_dollars"])

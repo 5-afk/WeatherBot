@@ -1,14 +1,14 @@
 # Kalshi Weather Bot
 
-This is a beginner-friendly Python 3.11+ trading bot for Kalshi weather prediction markets. It starts in dry-run mode, watches NWS/GFS model cycle release times, scans KXHIGH/KXLOW markets, compares GFS and ICON ensembles against NWS forecasts, asks Claude for a conservative sanity check, and only then simulates or places a limit order.
+This is a beginner-friendly Python 3.11+ trading bot for Kalshi weather prediction markets. It starts in dry-run mode, watches NWS forecast update times, scans KXHIGH/KXLOW markets, uses NWS gridded hourly forecasts with a normal-distribution probability model, asks Claude for a conservative sanity check, and only then simulates or places a limit order.
 
 ## What It Does
 
-- Runs the full pipeline at 03:30, 09:30, 15:30, and 21:30 UTC when new NWS/GFS cycle data should be available.
+- Runs the full pipeline at 03:30, 09:30, 15:30, and 21:30 UTC when new NWS forecast data should be available.
 - Runs a backup scan every 30 minutes.
-- Watches New York, Chicago, Miami, Los Angeles, and Denver KXHIGH/KXLOW markets.
-- Pulls free Open-Meteo GFS and ICON ensemble weather data.
-- Cross-checks NWS point forecasts using the correct settlement station area.
+- Watches 13 US cities (KXHIGH/KXLOW/KXLOWT markets).
+- Pulls free NWS gridded hourly forecast data (no API key, no rate limits).
+- Estimates trade probability using NWS forecast + normal CDF (sigma 3.5°F).
 - Trades only in dry-run mode unless `DRY_RUN=false`.
 - Uses SQLite at `data/positions.db` and JSON P&L at `data/pnl.json`.
 
@@ -60,7 +60,7 @@ Live trading requires valid Kalshi API credentials and `DRY_RUN=false`. The bot 
 - `src/nws_watcher.py` schedules model-cycle and backup scans.
 - `src/trader.py` runs the full market pipeline.
 - `src/kalshi_client.py` talks to Kalshi.
-- `src/weather_client.py` talks to Open-Meteo and NWS.
+- `src/weather_client.py` talks to NWS gridded forecasts and station observations.
 - `src/edge_engine.py` calculates probabilities, confidence, and edge.
 - `src/claude_checker.py` asks Claude for GO/NOGO.
 - `src/position_sizer.py` calculates Kelly position size.
