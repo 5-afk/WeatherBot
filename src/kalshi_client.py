@@ -166,7 +166,8 @@ class KalshiClient:
             "side": book_side,
             "count": f"{count:.2f}",
             "price": f"{yes_leg_price:.4f}",
-            "time_in_force": "good_till_canceled",
+            # IOC: fill instantly against the resting ask, cancel any remainder.
+            "time_in_force": "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
         }
 
@@ -260,6 +261,25 @@ class KalshiClient:
         except Exception as exc:
             logging.warning("Order cancel failed for %s: %s", order_id, exc)
             return False
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        """Fetch the account's non-zero market positions.
+
+        GET /portfolio/positions returns market_positions[] where position_fp is
+        a signed fixed-point string: positive = YES contracts, negative = NO.
+        market_exposure_dollars is the cost of the aggregate position.
+        """
+        try:
+            data = self._request(
+                "GET",
+                "/portfolio/positions",
+                params={"count_filter": "position", "limit": 1000},
+                auth_required=True,
+            )
+            return data.get("market_positions", []) or []
+        except Exception as exc:
+            logging.warning("Positions fetch failed: %s", exc)
+            return []
 
     def get_balance(self) -> float | None:
         """Fetch real account balance with retry on connection errors."""

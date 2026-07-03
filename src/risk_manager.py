@@ -215,9 +215,14 @@ class RiskManager:
         return row is not None
 
     def open_position_count(self) -> int:
-        """Count currently open positions."""
+        """Count live open positions, excluding dry-run rows.
+
+        Dry-run positions must not consume the live MAX_OPEN_POSITIONS budget.
+        """
         with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) FROM positions WHERE status = 'open'").fetchone()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM positions WHERE status = 'open' AND dry_run = 0"
+            ).fetchone()
         return int(row[0])
 
     def realized_pnl_today(self) -> float:

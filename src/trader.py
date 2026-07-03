@@ -527,31 +527,32 @@ class Trader:
             return
 
         order_id = str(response.get("order", {}).get("order_id") or response.get("order_id") or "")
-        if not order_id:
-            self._log_skip(city, market, "Kalshi order placed but no order_id returned.", edge)
-            return
 
-        filled_count = 0
-        for _attempt in range(6):
-            time.sleep(5)
-            status = self.kalshi.get_order_status(order_id)
-            if status["status"] == "filled":
-                filled_count = status["filled_count"]
-                logging.info(
-                    "[BET CONFIRMED] %s %s | %d contracts filled",
-                    market.ticker,
-                    edge.side,
-                    filled_count,
-                )
-                break
-            if status["status"] == "canceled":
-                logging.warning("[BET CANCELED] %s order was canceled before filling", market.ticker)
-                return
+        # IOC orders are terminal on return: Kalshi fills what it can against the
+        # resting ask and cancels any remainder. The V2 create response reports
+        # the immediate fill count, so read it directly — no polling, no timeout,
+        # no follow-up cancel needed.
+        fill_raw = response.get("fill_count", response.get("filled_count", 0))
+        try:
+            filled_count = int(float(fill_raw or 0))
+        except (TypeError, ValueError):
+            filled_count = 0
 
         if filled_count < 1:
-            self.kalshi.cancel_order(order_id)
-            logging.warning("[BET TIMEOUT] %s order not filled in 30s — canceled", market.ticker)
+            logging.warning(
+                "[BET UNFILLED] %s IOC order filled 0 contracts — no marketable liquidity at $%.2f",
+                market.ticker,
+                edge.limit_price or 0.0,
+            )
             return
+
+        logging.info(
+            "[BET CONFIRMED] %s %s | %d contracts filled (order %s)",
+            market.ticker,
+            edge.side,
+            filled_count,
+            order_id or "n/a",
+        )
 
         actual_stake = round(filled_count * (edge.limit_price or 0.0), 2)
         logging.getLogger().log(

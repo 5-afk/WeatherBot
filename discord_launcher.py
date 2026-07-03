@@ -316,6 +316,23 @@ class BotLauncher:
             else:
                 await ctx.send("⚠️ Could not fetch balance")
 
+        @self.bot.command(name="syncpositions")
+        async def syncpositions_cmd(ctx):
+            """Sync open positions from the Kalshi API into the local SQLite DB."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            await ctx.send("🔄 Syncing positions from Kalshi...")
+            try:
+                synced, lines = launcher._sync_positions_from_kalshi()
+            except Exception as exc:
+                await ctx.send(f"⚠️ Sync failed: {exc}")
+                return
+            if synced == 0:
+                await ctx.send("No open positions found on Kalshi.")
+                return
+            body = "\n".join(lines)
+            await ctx.send(f"✅ Synced {synced} position(s):\n```\n{body}\n```")
+
         @self.bot.command(name="ps")
         async def ps_cmd(ctx):
             """Show discord_launcher processes for remote diagnostics."""
@@ -382,6 +399,7 @@ class BotLauncher:
                 "!status  — check if bot is running\n"
                 "!pnl     — show profit/loss summary\n"
                 "!balance — show real Kalshi account balance\n"
+                "!syncpositions — sync open Kalshi positions into local DB\n"
                 "!logs    — show last 30 log lines\n"
                 "!logsfull — upload full log file\n"
                 "!logssince [hours] — upload recent logs\n"
@@ -429,7 +447,7 @@ class BotLauncher:
 
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
-            "status", "balance", "logs", "logsfull",
+            "status", "balance", "syncpositions", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }
         registered = {command.name for command in self.bot.commands}
@@ -555,6 +573,56 @@ class BotLauncher:
         if 18 <= et_hour < 23:
             return "🟠 Evening (every 30 min)"
         return "🔵 Overnight (every 60 min)"
+
+    def _sync_positions_from_kalshi(self):
+        """Pull non-zero positions from Kalshi and upsert them into SQLite.
+
+        Returns (count_synced, summary_lines). Idempotent on ticker: an existing
+        row is updated to reflect the live contract count/stake and reopened.
+        """
+        client = KalshiClient()
+        positions = client.get_positions()
+        db_path = PROJECT_ROOT / "data" / "positions.db"
+        synced = 0
+        lines = []
+        with sqlite3.connect(db_path) as conn:
+            for pos in positions:
+                try:
+                    contracts_signed = int(float(pos.get("position_fp") or 0))
+                except (TypeError, ValueError):
+                    contracts_signed = 0
+                if contracts_signed == 0:
+                    continue
+                ticker = str(pos.get("ticker", ""))
+                if not ticker:
+                    continue
+                side = "yes" if contracts_signed > 0 else "no"
+                contracts = abs(contracts_signed)
+                try:
+                    stake = abs(float(pos.get("market_exposure_dollars") or 0.0))
+                except (TypeError, ValueError):
+                    stake = 0.0
+                price = round(stake / contracts, 4) if contracts else 0.0
+                city = ticker.split("-", 1)[0] or "synced"
+                now = datetime.now(tz=zoneinfo.ZoneInfo("UTC")).isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO positions
+                    (ticker, city, side, contracts, price, stake, status, dry_run, order_id, opened_at, closed_at, realized_pnl)
+                    VALUES (?, ?, ?, ?, ?, ?, 'open', 0, NULL, ?, NULL, 0)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        side=excluded.side,
+                        contracts=excluded.contracts,
+                        price=excluded.price,
+                        stake=excluded.stake,
+                        status='open',
+                        closed_at=NULL
+                    """,
+                    (ticker, city, side, contracts, price, stake, now),
+                )
+                synced += 1
+                lines.append(f"{ticker} {side.upper()} {contracts} @ ${price:.2f} (${stake:.2f})")
+        return synced, lines
 
     def _db_status(self):
         """Read budget and P&L status directly from SQLite."""

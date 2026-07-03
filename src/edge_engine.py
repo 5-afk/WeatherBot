@@ -479,9 +479,14 @@ class EdgeEngine:
         return round(delta.total_seconds() / 3600, 2)
 
     def limit_price(self, side: str, ask_price: float) -> float:
-        """Return a limit price one cent better than the current ask."""
+        """Return the exact ask so the order is marketable and fills instantly.
+
+        Shaving a cent off the ask left the order resting below the book and
+        never filling. Pricing at the ask crosses immediately against the
+        resting offer.
+        """
         del side
-        return round(max(0.01, ask_price - 0.01), 2)
+        return round(max(0.01, min(0.99, ask_price)), 2)
 
     def _temperature_buffer_score(
         self,
