@@ -161,7 +161,7 @@ class WeatherClient:
         time.sleep(5.0)
         for city in cities:
             for model_key in ("gfs", "icon"):
-                self.get_ensemble_forecast(city, model_key, target_date, "high", retries=1)
+                self.get_ensemble_forecast(city, model_key, target_date, "high", allow_fetch=True)
                 time.sleep(2.0)
             time.sleep(4.0)
 
@@ -171,28 +171,38 @@ class WeatherClient:
         model_key: str,
         target_date: date,
         market_type: str,
-        retries: int = 0,
+        allow_fetch: bool = False,
     ) -> EnsembleForecast:
-        """Fetch a GFS or ICON ensemble and reduce members to daily highs/lows.
+        """Return a GFS or ICON ensemble reduced to daily highs/lows.
 
         Caches both the HIGH and LOW member distributions per (city, model, date)
         so HIGH and LOW markets for the same city reuse a single API call.
 
-        Single attempt only: on a 429 (or any error) we log and immediately return
-        an empty forecast. No retry, no backoff, no sleeping in the evaluation path
-        — staggering belongs in prewarm_cache. The ``retries`` argument is retained
-        for call-site compatibility but ignored.
+        API calls happen ONLY when ``allow_fetch=True`` (prewarm_cache). In the
+        evaluation path (``allow_fetch=False``, the default) a cache hit is
+        returned and a cache miss returns an empty forecast immediately with zero
+        network calls — making it impossible for evaluation threads to hit the API
+        or stall on rate limits. On a 429 (or any error) during prewarm we log and
+        return an empty forecast: no retry, no backoff, no sleeping.
         """
-        del retries
         model_name = self.model_names[model_key]
         cache_key = (city.name, model_key, str(target_date))
         want = "high" if market_type == "high" else "low"
+        empty = EnsembleForecast(model_name, [], None, 0)
         with self._cache_lock:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 bundle, expires_at = cached
                 if datetime.now() < expires_at:
                     return bundle[want]
+
+        if not allow_fetch:
+            logging.debug(
+                "Cache miss for %s %s — prewarm did not cover this key; returning empty.",
+                city.name,
+                model_key,
+            )
+            return empty
 
         params = {
             "latitude": city.lat,
@@ -202,7 +212,6 @@ class WeatherClient:
             "forecast_days": 3,
             "models": model_name,
         }
-        empty = EnsembleForecast(model_name, [], None, 0)
         try:
             with self._api_semaphore:
                 response = self.session.get(

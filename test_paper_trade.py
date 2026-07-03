@@ -212,8 +212,8 @@ def main() -> None:
         target_date = settlement_time.astimezone(timezone.utc).date()
 
         try:
-            gfs = weather.get_ensemble_forecast(city, "gfs", target_date, market_type)
-            icon = weather.get_ensemble_forecast(city, "icon", target_date, market_type)
+            gfs = weather.get_ensemble_forecast(city, "gfs", target_date, market_type, allow_fetch=True)
+            icon = weather.get_ensemble_forecast(city, "icon", target_date, market_type, allow_fetch=True)
             nws = weather.get_nws_forecast(city, target_date, market_type)
         except Exception as exc:
             print(f"\nMarket: {market.ticker}\nCity: {city.name}\nWould bet: NO\nReason: Weather fetch failed: {exc}")
