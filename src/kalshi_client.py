@@ -164,16 +164,18 @@ class KalshiClient:
         body.pop("no_price", None)
 
         # Log the EXACT request body being sent to Kalshi before the POST.
-        logging.warning("Order request body: %s", json.dumps(body, indent=2))
+        logging.warning("ORDER REQUEST: %s", json.dumps(body, indent=2))
 
         try:
             return self._request("POST", "/portfolio/orders", json=body, auth_required=True)
         except requests.HTTPError as exc:
-            response = exc.response
-            status_code = getattr(response, "status_code", None)
-            response_text = getattr(response, "text", "") if response is not None else ""
-            # Log the EXACT response body — this contains Kalshi's error message.
-            logging.warning("Order response %s: %s", status_code, response_text)
+            if exc.response is not None:
+                # Log the EXACT response body — this contains Kalshi's error message.
+                logging.warning(
+                    "ORDER RESPONSE %d: %s",
+                    exc.response.status_code,
+                    exc.response.text,
+                )
             raise
 
     def test_connection(self) -> bool:
