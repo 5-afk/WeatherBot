@@ -353,10 +353,12 @@ class KalshiClient:
         no_bid = self._extract_price(raw, "no_bid")
         no_ask = self._extract_price(raw, "no_ask")
         logging.debug(
-            "Parsed prices ticker=%s yes_ask=%r no_ask=%r",
+            "Parsed %s: yes_ask=%s no_ask=%s yes_bid=%s no_bid=%s",
             raw.get("ticker", ""),
             yes_ask,
             no_ask,
+            yes_bid,
+            no_bid,
         )
         return KalshiMarket(
             ticker=str(raw.get("ticker", "")),
