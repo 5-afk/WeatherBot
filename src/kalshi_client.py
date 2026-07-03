@@ -163,7 +163,23 @@ class KalshiClient:
         body.pop("yes_price", None)
         body.pop("no_price", None)
 
-        return self._request("POST", "/portfolio/orders", json=body, auth_required=True)
+        try:
+            return self._request("POST", "/portfolio/orders", json=body, auth_required=True)
+        except requests.HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", None)
+            if status_code == 410:
+                # Fetch full market data to discover which field distinguishes
+                # "active and accepting orders" from "active but order book closed".
+                try:
+                    debug_resp = self._request("GET", f"/markets/{ticker}", auth_required=False)
+                    logging.warning(
+                        "410 debug for %s — complete market JSON: %s",
+                        ticker,
+                        json.dumps(debug_resp, indent=2, default=str),
+                    )
+                except Exception as debug_exc:
+                    logging.warning("410 debug fetch failed for %s: %s", ticker, debug_exc)
+            raise
 
     def test_connection(self) -> bool:
         """Return True when Kalshi reports the exchange is active."""
