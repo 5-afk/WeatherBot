@@ -262,6 +262,18 @@ class KalshiClient:
             logging.warning("Order cancel failed for %s: %s", order_id, exc)
             return False
 
+    def get_market(self, ticker: str) -> KalshiMarket | None:
+        """Fetch a single market by ticker as a normalized KalshiMarket."""
+        try:
+            data = self._request("GET", f"/markets/{ticker}", auth_required=False)
+        except Exception as exc:
+            logging.warning("Market fetch failed for %s: %s", ticker, exc)
+            return None
+        raw = data.get("market", data)
+        if not raw:
+            return None
+        return self._normalize_market(raw)
+
     def get_positions(self) -> list[dict[str, Any]]:
         """Fetch the account's non-zero market positions.
 

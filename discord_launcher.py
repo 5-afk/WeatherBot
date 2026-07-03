@@ -186,6 +186,7 @@ class BotLauncher:
             paused = "Yes" if (PROJECT_ROOT / "data" / "paused.flag").exists() else "No"
             last_scan = launcher._last_scan_time()
             window = launcher._scan_window()
+            max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
             if launcher._is_running():
                 await ctx.send(
                     "🤖 KalshiBot Status\n"
@@ -194,7 +195,7 @@ class BotLauncher:
                     f"Running budget: ${state['running_budget']:.2f} (compounded)\n"
                     f"{balance_line}\n"
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
-                    f"Open positions: {state['open_positions']} / 1\n"
+                    f"Open positions: {state['open_positions']} / {max_positions}\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
                     f"Scan window: {window}\n"
                     f"Paused: {paused}\n"
@@ -211,7 +212,7 @@ class BotLauncher:
                     f"Running budget: ${state['running_budget']:.2f} (compounded)\n"
                     f"{balance_line}\n"
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
-                    f"Open positions: {state['open_positions']} / 1\n"
+                    f"Open positions: {state['open_positions']} / {max_positions}\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
                     f"Scan window: {window}\n"
                     f"Paused: {paused}\n"
@@ -316,6 +317,18 @@ class BotLauncher:
             else:
                 await ctx.send("⚠️ Could not fetch balance")
 
+        @self.bot.command(name="positions")
+        async def positions_cmd(ctx):
+            """Show currently open positions fetched live from Kalshi with P&L."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            try:
+                report = launcher._open_positions_report()
+            except Exception as exc:
+                await ctx.send(f"⚠️ Could not fetch positions: {exc}")
+                return
+            await ctx.send(report)
+
         @self.bot.command(name="syncpositions")
         async def syncpositions_cmd(ctx):
             """Sync open positions from the Kalshi API into the local SQLite DB."""
@@ -399,6 +412,7 @@ class BotLauncher:
                 "!status  — check if bot is running\n"
                 "!pnl     — show profit/loss summary\n"
                 "!balance — show real Kalshi account balance\n"
+                "!positions — show open positions with live P&L\n"
                 "!syncpositions — sync open Kalshi positions into local DB\n"
                 "!logs    — show last 30 log lines\n"
                 "!logsfull — upload full log file\n"
@@ -447,7 +461,7 @@ class BotLauncher:
 
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
-            "status", "balance", "syncpositions", "logs", "logsfull",
+            "status", "balance", "positions", "syncpositions", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }
         registered = {command.name for command in self.bot.commands}
@@ -559,7 +573,7 @@ class BotLauncher:
         if not log_path.exists():
             return "Never"
         for line in reversed(log_path.read_text(encoding="utf-8", errors="replace").splitlines()):
-            if "Full pipeline started" in line or "Startup scan requested" in line:
+            if "[CYCLE] Pipeline started" in line or "Pipeline started" in line:
                 return line[:19]
         return "Never"
 
@@ -573,6 +587,59 @@ class BotLauncher:
         if 18 <= et_hour < 23:
             return "🟠 Evening (every 30 min)"
         return "🔵 Overnight (every 60 min)"
+
+    def _open_positions_report(self) -> str:
+        """Build a Discord-friendly report of live open positions with P&L."""
+        client = KalshiClient()
+        positions = client.get_positions()
+        rows = []
+        for pos in positions:
+            try:
+                contracts_signed = int(float(pos.get("position_fp") or 0))
+            except (TypeError, ValueError):
+                contracts_signed = 0
+            if contracts_signed == 0:
+                continue
+            rows.append((pos, contracts_signed))
+
+        max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+        if not rows:
+            return f"📊 Open Positions (0/{max_positions})\nNo open positions on Kalshi."
+
+        lines = [f"📊 Open Positions ({len(rows)}/{max_positions})"]
+        for pos, contracts_signed in rows:
+            ticker = str(pos.get("ticker", ""))
+            side = "YES" if contracts_signed > 0 else "NO"
+            contracts = abs(contracts_signed)
+            try:
+                cost = abs(float(pos.get("market_exposure_dollars") or 0.0))
+            except (TypeError, ValueError):
+                cost = 0.0
+            avg_price = cost / contracts if contracts else 0.0
+            payout = contracts * 1.0
+
+            # Current mark: what we could sell the held side for right now.
+            market = client.get_market(ticker)
+            current_bid = None
+            if market is not None:
+                current_bid = market.yes_bid if side == "YES" else market.no_bid
+            if current_bid is not None:
+                current_value = contracts * current_bid
+                pnl = current_value - cost
+                pct = (pnl / cost * 100) if cost else 0.0
+                pnl_str = f"P&L: {'-' if pnl < 0 else '+'}${abs(pnl):.2f} ({pct:+.0f}%)"
+            else:
+                pnl_str = "P&L: n/a"
+
+            lines.append(
+                f"{ticker} | {side} | {contracts} contracts @ ${avg_price:.2f} | "
+                f"Cost: ${cost:.2f} | Payout: ${payout:.2f} | {pnl_str}"
+            )
+
+        balance = client.get_balance()
+        if balance is not None:
+            lines.append(f"Cash remaining: ${balance:.2f}")
+        return "\n".join(lines)
 
     def _sync_positions_from_kalshi(self):
         """Pull non-zero positions from Kalshi and upsert them into SQLite.
@@ -636,7 +703,7 @@ class BotLauncher:
             "SELECT COALESCE(SUM(realized_pnl), 0) FROM pnl WHERE DATE(created_at) = DATE('now')",
             0.0,
         )
-        open_positions = int(self._scalar("SELECT COUNT(*) FROM positions WHERE status = 'open'", 0.0))
+        open_positions = int(self._scalar("SELECT COUNT(*) FROM positions WHERE status = 'open' AND dry_run = 0", 0.0))
         return {
             "running_budget": running_budget,
             "total_pocketed": total_pocketed,

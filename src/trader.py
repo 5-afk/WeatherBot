@@ -85,6 +85,7 @@ class Trader:
         self.dry_run = env_bool("DRY_RUN", True)
         self.paused = False
         self.last_scan_time: datetime | None = None
+        self._last_settlement_check: datetime | None = None
         self.pnl_path = DATA_DIR / "pnl.json"
         self.kalshi = KalshiClient()
         self.weather = WeatherClient()
@@ -113,6 +114,12 @@ class Trader:
 
         self.last_scan_time = datetime.now(timezone.utc)
         logging.getLogger().log(CYCLE_LEVEL, "[CYCLE] Pipeline started. dry_run=%s", self.dry_run)
+
+        # Hourly-throttled settlement check for any open live positions.
+        try:
+            self.check_settlements()
+        except Exception as exc:
+            logging.warning("Settlement check failed: %s", exc)
 
         self._scan_bets = 0
         self._scan_skips = 0
@@ -591,7 +598,7 @@ class Trader:
         )
         self._scan_bets = getattr(self, "_scan_bets", 0) + 1
         self._append_pnl_position(city, market, edge, size, dry_run=False)
-        self._send_bet_alert(city, edge, size, dry_run=False)
+        self._send_live_bet_alert(city, market, edge, filled_count, actual_stake)
 
     def _log_skip(
         self,
@@ -770,6 +777,97 @@ class Trader:
         running_pnl = self.risk.current_balance() - self.risk.starting_balance
         self._send_discord(f"{self._user_ping()}✅ WIN +${profit:.2f}\n{city} resolved {side}\nRunning P&L: ${running_pnl:.2f}")
 
+    def _send_live_bet_alert(
+        self,
+        city: CityConfig,
+        market: KalshiMarket,
+        edge: EdgeDecision,
+        filled_count: int,
+        actual_stake: float,
+    ) -> None:
+        """Notify Discord of a confirmed live fill using the actual fill data."""
+        side_label = (edge.side or "yes").upper()
+        payout = filled_count * 1.0
+        profit_if_win = payout - actual_stake
+        budget_remaining = self.risk.get_todays_budget()
+        title = market.title or market.ticker
+        sub = market.subtitle or (f"{edge.threshold_f:.0f}°+" if edge.threshold_f else "")
+        self._send_discord(
+            "🎯 BET PLACED — LIVE\n"
+            f"Market: {title}\n"
+            f"Side: {side_label}" + (f" ({sub})" if sub else "") + "\n"
+            f"Contracts: {filled_count} @ ${edge.limit_price or 0.0:.2f}\n"
+            f"Total cost: ${actual_stake:.2f}\n"
+            f"Payout if right: ${payout:.2f} (+${profit_if_win:.2f})\n"
+            f"Budget remaining: ${budget_remaining:.2f}",
+            mention=True,
+        )
+
+    def check_settlements(self) -> None:
+        """Resolve any open live positions whose market has settled.
+
+        Runs at most once per hour. For each open (non-dry-run) position, fetch
+        the market; if it has settled, record the win/loss in SQLite and send a
+        Discord alert with the realized P&L and new balance.
+        """
+        now = datetime.now(timezone.utc)
+        last = getattr(self, "_last_settlement_check", None)
+        if last is not None and (now - last).total_seconds() < 3600:
+            return
+        self._last_settlement_check = now
+
+        try:
+            open_positions = self.risk.open_positions_detail()
+        except Exception as exc:
+            logging.warning("Settlement check could not read positions: %s", exc)
+            return
+
+        for pos in open_positions:
+            ticker = pos["ticker"]
+            try:
+                market = self.kalshi.get_market(ticker)
+            except Exception as exc:
+                logging.warning("Settlement check market fetch failed for %s: %s", ticker, exc)
+                continue
+            if market is None:
+                continue
+            status = str(market.raw.get("status", "")).lower()
+            result = str(market.raw.get("result", "")).lower()
+            if status not in {"settled", "finalized"} or result not in {"yes", "no"}:
+                continue
+
+            side = str(pos["side"]).lower()
+            contracts = int(pos["contracts"])
+            stake = float(pos["stake"])
+            won = (side == result)
+            if won:
+                payout = contracts * 1.0
+                realized = round(payout - stake, 2)
+            else:
+                payout = 0.0
+                realized = round(-stake, 2)
+
+            self.risk.record_resolution(ticker, realized)
+            new_balance = self.risk.current_balance()
+            settle_price = 1.00 if won else 0.00
+            if won:
+                self._send_discord(
+                    f"✅ BET WON — {ticker}\n"
+                    f"{side.upper()} {contracts} contracts · settled at ${settle_price:.2f}\n"
+                    f"Profit: +${realized:.2f}\n"
+                    f"New balance: ${new_balance:.2f}",
+                    mention=True,
+                )
+            else:
+                self._send_discord(
+                    f"❌ BET LOST — {ticker}\n"
+                    f"{side.upper()} {contracts} contracts · settled at ${settle_price:.2f}\n"
+                    f"Loss: -${abs(realized):.2f}\n"
+                    f"New balance: ${new_balance:.2f}",
+                    mention=True,
+                )
+            logging.info("[SETTLED] %s %s result=%s realized=%.2f", ticker, side, result, realized)
+
     def _user_ping(self) -> str:
         """Return a Discord user mention string for notifications."""
         user_id = os.getenv("DISCORD_USER_ID", "").strip()
@@ -777,12 +875,18 @@ class Trader:
             return f"<@{user_id}>\n"
         return ""
 
-    def _send_discord(self, message: str) -> None:
-        """Send an alert to a private Discord channel."""
+    def _send_discord(self, message: str, *, mention: bool = False) -> None:
+        """Send an alert to a private Discord channel.
+
+        When mention=True, the user ping is placed OUTSIDE the code block so
+        Discord actually delivers the notification (mentions inside code fences
+        do not trigger alerts).
+        """
         token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
         channel_id = os.getenv("DISCORD_CHANNEL_ID", "").strip()
         if not token or not channel_id or token == "your_token_here":
             return
+        ping = self._user_ping().strip() if mention else ""
         try:
             url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
             headers = {
@@ -791,11 +895,14 @@ class Trader:
             }
             # Discord has a 2000 character limit per message
             chunks = [message[i:i+1900] for i in range(0, len(message), 1900)]
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
+                content = f"```\n{chunk}\n```"
+                if ping and index == 0:
+                    content = f"{ping}\n{content}"
                 response = requests.post(
                     url,
                     headers=headers,
-                    json={"content": f"```\n{chunk}\n```"},
+                    json={"content": content},
                     timeout=10,
                 )
                 response.raise_for_status()

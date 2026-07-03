@@ -40,6 +40,8 @@ class RiskManager:
         """Check all hard stops before a bet is allowed."""
         if self._get_state("permanent_halt") == "true":
             return RiskCheck(False, "Permanent halt active after drawdown breach.", True)
+        if self.has_open_position(ticker):
+            return RiskCheck(False, f"Already have open position on {ticker}.")
         if self.no_duplicate_tickers and self.has_ever_traded(ticker):
             return RiskCheck(False, f"No duplicate tickers: {ticker} was already traded.")
         if self.open_position_count() >= self.max_open_positions:
@@ -213,6 +215,40 @@ class RiskManager:
         with self._connect() as conn:
             row = conn.execute("SELECT 1 FROM positions WHERE ticker = ? LIMIT 1", (ticker,)).fetchone()
         return row is not None
+
+    def has_open_position(self, ticker: str) -> bool:
+        """Return True if a live (non-dry-run) open position exists for ticker.
+
+        Prevents doubling down on a market the bot already holds.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM positions WHERE ticker = ? AND status = 'open' AND dry_run = 0 LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        return row is not None
+
+    def open_positions_detail(self) -> list[dict]:
+        """Return live open positions as dicts for settlement processing."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ticker, city, side, contracts, price, stake
+                FROM positions
+                WHERE status = 'open' AND dry_run = 0
+                """
+            ).fetchall()
+        return [
+            {
+                "ticker": r[0],
+                "city": r[1],
+                "side": r[2],
+                "contracts": int(r[3]),
+                "price": float(r[4]),
+                "stake": float(r[5]),
+            }
+            for r in rows
+        ]
 
     def open_position_count(self) -> int:
         """Count live open positions, excluding dry-run rows.
