@@ -109,7 +109,7 @@ class WeatherClient:
         # Cache at (city, model, date) level — one fetch yields both HIGH and LOW
         # member distributions, so KXHIGH/KXLOW/KXLOWT markets reuse the same call.
         self._cache: dict[tuple[str, str, str], tuple[dict[str, EnsembleForecast], datetime]] = {}
-        cache_ttl_minutes = int(os.getenv("OPEN_METEO_CACHE_TTL_MINUTES", "30"))
+        cache_ttl_minutes = int(os.getenv("OPEN_METEO_CACHE_TTL_MINUTES", "60"))
         self._cache_ttl = timedelta(minutes=cache_ttl_minutes)
         self._cache_lock = threading.Lock()
         # Limit concurrent Open-Meteo HTTP calls so parallel scans do not trip
@@ -139,15 +139,18 @@ class WeatherClient:
         """Pre-fetch all ensemble data sequentially before market evaluation begins.
 
         Fills the (city, model, date) cache once per scan cycle with staggered
-        delays (1.5s between models, 2.0s between cities) so the parallel
-        evaluation phase hits cache instead of hammering Open-Meteo. A 429 is logged and skipped (no aggressive retry);
-        affected cities fall back to fewer models for this cycle.
+        delays (5s initial cooldown, 3.0s between models, 4.0s between cities)
+        so the parallel evaluation phase hits cache instead of hammering Open-Meteo.
+        A 429 is logged and skipped (no aggressive retry); affected cities fall back
+        to fewer models for this cycle.
         """
+        logging.info("Prewarming cache — waiting 5s before first fetch...")
+        time.sleep(5.0)
         for city in cities:
             for model_key in ("gfs", "ecmwf", "icon"):
                 self.get_ensemble_forecast(city, model_key, target_date, "high", retries=1)
-                time.sleep(1.5)
-            time.sleep(2.0)
+                time.sleep(3.0)
+            time.sleep(4.0)
 
     def get_ensemble_forecast(
         self,
