@@ -44,6 +44,10 @@ class KalshiClient:
     # Kalshi returns "active" for open tradeable markets; accept "open" too.
     TRADEABLE_STATUSES = {"active", "open"}
 
+    # V2 order endpoint. The legacy /portfolio/orders path now 410s with
+    # deprecated_v1_order_endpoint; create/cancel live under /events/orders.
+    ORDERS_PATH = "/portfolio/events/orders"
+
     def __init__(self) -> None:
         """Create one reusable HTTP session and read credentials from env vars."""
         self.env = os.getenv("KALSHI_ENV", "demo").strip().lower()
@@ -145,29 +149,32 @@ class KalshiClient:
         if not 0.01 <= limit_price <= 0.99:
             raise ValueError("limit_price must be between 0.01 and 0.99")
 
-        price_str = f"{limit_price:.4f}"
+        # V2 create-order (/portfolio/events/orders) quotes everything on the
+        # YES leg: book_side "bid" = buy YES, "ask" = buy NO. A NO buy at price
+        # p is economically "sell YES at 1 - p", so the submitted YES-leg price
+        # is (1 - limit_price) for the NO side.
+        if side == "yes":
+            book_side = "bid"
+            yes_leg_price = limit_price
+        else:
+            book_side = "ask"
+            yes_leg_price = round(1.0 - limit_price, 4)
+
         body: dict[str, Any] = {
             "ticker": ticker,
-            "action": "buy",
-            "side": side,
-            "type": "limit",
-            "count": count,
             "client_order_id": str(uuid.uuid4()),
+            "side": book_side,
+            "count": f"{count:.2f}",
+            "price": f"{yes_leg_price:.4f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        if side == "yes":
-            body["yes_price_dollars"] = price_str
-        else:
-            body["no_price_dollars"] = price_str
-
-        # Kalshi's 2026 API expects dollar-string fields, not integer cents.
-        body.pop("yes_price", None)
-        body.pop("no_price", None)
 
         # Log the EXACT request body being sent to Kalshi before the POST.
         logging.warning("ORDER REQUEST: %s", json.dumps(body, indent=2))
 
         try:
-            return self._request("POST", "/portfolio/orders", json=body, auth_required=True)
+            return self._request("POST", self.ORDERS_PATH, json=body, auth_required=True)
         except requests.HTTPError as exc:
             if exc.response is not None:
                 # Log the EXACT response body — this contains Kalshi's error message.
@@ -217,25 +224,39 @@ class KalshiClient:
             return neutral
 
     def get_order_status(self, order_id: str) -> dict[str, Any]:
-        """Poll order status. Returns status, filled_count, remaining_count."""
+        """Poll order status. Returns status, filled_count, remaining_count.
+
+        Get Order remains at GET /portfolio/orders/{order_id} per the Kalshi
+        docs, but the V2 response reports fixed-point string counts
+        (fill_count_fp / remaining_count_fp) and a resting/canceled/executed
+        status enum. Fall back to the legacy integer fields when present.
+        """
         try:
             data = self._request("GET", f"/portfolio/orders/{order_id}", auth_required=True)
             order = data.get("order", data)
+            filled = order.get("fill_count_fp", order.get("filled_count", 0))
+            remaining = order.get("remaining_count_fp", order.get("remaining_count", 0))
             return {
                 "status": str(order.get("status", "")).lower(),
-                "filled_count": int(order.get("filled_count", 0) or 0),
-                "remaining_count": int(order.get("remaining_count", 0) or 0),
+                "filled_count": int(float(filled or 0)),
+                "remaining_count": int(float(remaining or 0)),
             }
         except Exception as exc:
             logging.warning("Order status fetch failed for %s: %s", order_id, exc)
             return {"status": "unknown", "filled_count": 0, "remaining_count": 0}
 
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel a resting order."""
+        """Cancel a resting order via the V2 endpoint.
+
+        DELETE /portfolio/events/orders/{order_id} returns
+        {order_id, client_order_id, reduced_by, ts_ms} (no status field), so a
+        successful HTTP response means the cancel was accepted.
+        """
         try:
-            data = self._request("DELETE", f"/portfolio/orders/{order_id}", auth_required=True)
-            order = data.get("order", data)
-            return str(order.get("status", "")).lower() == "canceled"
+            data = self._request(
+                "DELETE", f"{self.ORDERS_PATH}/{order_id}", auth_required=True
+            )
+            return bool(data.get("order_id") or data.get("reduced_by") is not None)
         except Exception as exc:
             logging.warning("Order cancel failed for %s: %s", order_id, exc)
             return False
