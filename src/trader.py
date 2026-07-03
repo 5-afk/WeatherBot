@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +94,7 @@ class Trader:
         self.risk = RiskManager(DATA_DIR / "positions.db")
         self._claude_calls_today = 0
         self._claude_call_date = datetime.now(timezone.utc).date()
+        self._scan_lock = threading.Lock()
         # Always sync real balance from Kalshi on startup
         real_balance = self.kalshi.get_balance()
         if real_balance and real_balance > 0:
@@ -153,27 +156,31 @@ class Trader:
                 )
                 market_rows.extend((city, market, ladder_multiplier) for market in markets)
 
+        # Pre-warm the ensemble cache once per scan (sequential, staggered) so the
+        # parallel evaluation phase hits cache instead of the Open-Meteo rate limit.
+        target_dates: set[date] = set()
+        for _city, market, _ladder in market_rows:
+            settlement_time = market.settlement_time or market.close_time
+            if settlement_time is not None:
+                target_dates.add(settlement_time.astimezone(timezone.utc).date())
+        cities = self.weather.watched_cities()
+        for target_date in sorted(target_dates):
+            self.weather.prewarm_cache(cities, target_date)
+
         candidates: list[tuple[CityConfig, KalshiMarket, EdgeDecision]] = []
-        total_checked = 0
-        for city, market, ladder_multiplier in market_rows:
-            total_checked += 1
-            try:
-                result = self._math_evaluate(city, market, ladder_multiplier)
-                if result:
-                    candidates.append(result)
-                    edge = result[2]
-                    logging.info(
-                        "[CANDIDATE] %s %.0fF %s | Edge: %.0f%% | EV: %.2f | Signal: %.2f | Imbalance: %.2f",
-                        city.short_code,
-                        edge.threshold_f or 0.0,
-                        (edge.side or "").upper(),
-                        (edge.edge or 0.0) * 100,
-                        edge.ev or 0.0,
-                        edge.signal_score,
-                        edge.imbalance_score,
-                    )
-            except Exception as exc:
-                logging.error("Eval failed %s: %s", market.ticker, exc)
+        total_checked = len(market_rows)
+        candidates = self._evaluate_all_markets(market_rows)
+        for city, market, edge in candidates:
+            logging.info(
+                "[CANDIDATE] %s %.0fF %s | Edge: %.0f%% | EV: %.2f | Signal: %.2f | Imbalance: %.2f",
+                city.short_code,
+                edge.threshold_f or 0.0,
+                (edge.side or "").upper(),
+                (edge.edge or 0.0) * 100,
+                edge.ev or 0.0,
+                edge.signal_score,
+                edge.imbalance_score,
+            )
 
         logging.info(
             "[CYCLE] Checked %d markets, %d candidates (%d cities x ~%d markets each)",
@@ -187,8 +194,6 @@ class Trader:
             self._maybe_record_day_end()
             self._send_scan_summary(real_balance, total_checked, 0)
             return
-
-        candidates.sort(key=lambda item: item[2].signal_score, reverse=True)
 
         if self._claude_calls_today >= max_calls:
             best_city, best_market, best_edge = candidates[0]
@@ -226,6 +231,30 @@ class Trader:
         self._maybe_record_day_end()
         self._send_scan_summary(real_balance, total_checked, len(candidates))
 
+    def _evaluate_all_markets(
+        self,
+        market_rows: list[tuple[CityConfig, KalshiMarket, float]],
+    ) -> list[tuple[CityConfig, KalshiMarket, EdgeDecision]]:
+        """Evaluate markets in parallel and return candidates sorted by signal score."""
+        results: list[tuple[CityConfig, KalshiMarket, EdgeDecision]] = []
+        max_workers = int(os.getenv("MAX_SCAN_WORKERS", "10"))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._math_evaluate, city, market, ladder): market
+                for city, market, ladder in market_rows
+            }
+            for future in as_completed(futures):
+                market = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logging.error("Eval failed %s: %s", market.ticker, exc)
+                    continue
+                if result is not None:
+                    results.append(result)
+        results.sort(key=lambda item: item[2].signal_score, reverse=True)
+        return results
+
     def _math_evaluate(
         self,
         city: CityConfig,
@@ -242,14 +271,21 @@ class Trader:
         target_date = settlement_time.astimezone(timezone.utc).date()
         cache_key = (city.name, target_date.isoformat(), market_type)
         try:
-            if cache_key not in self._weather_cache:
-                self._weather_cache[cache_key] = (
+            with self._scan_lock:
+                cached_weather = self._weather_cache.get(cache_key)
+            if cached_weather is None:
+                weather_bundle = (
                     self.weather.get_ensemble_forecast(city, "gfs", target_date, market_type),
                     self.weather.get_ensemble_forecast(city, "ecmwf", target_date, market_type),
                     self.weather.get_ensemble_forecast(city, "icon", target_date, market_type),
                     self.weather.get_nws_forecast(city, target_date, market_type),
                 )
-            gfs, ecmwf, icon, nws = self._weather_cache[cache_key]
+                with self._scan_lock:
+                    if cache_key not in self._weather_cache:
+                        self._weather_cache[cache_key] = weather_bundle
+                    gfs, ecmwf, icon, nws = self._weather_cache[cache_key]
+            else:
+                gfs, ecmwf, icon, nws = cached_weather
         except Exception as exc:
             logging.debug("Weather fetch failed %s: %s", market.ticker, exc)
             self._log_skip(city, market, f"Weather fetch failed: {exc}", None)
@@ -376,11 +412,13 @@ class Trader:
 
     def _current_temp_f(self, city: CityConfig) -> float | None:
         """Fetch latest station temperature from NWS and convert Celsius to Fahrenheit."""
-        if city.name in self._observation_cache:
-            return self._observation_cache[city.name]
+        with self._scan_lock:
+            if city.name in self._observation_cache:
+                return self._observation_cache[city.name]
         observation = self.weather.latest_station_observation(city)
         if not observation:
-            self._observation_cache[city.name] = None
+            with self._scan_lock:
+                self._observation_cache[city.name] = None
             return None
         value = (
             observation.get("properties", {})
@@ -390,10 +428,12 @@ class Trader:
         try:
             celsius = float(value)
         except (TypeError, ValueError):
-            self._observation_cache[city.name] = None
+            with self._scan_lock:
+                self._observation_cache[city.name] = None
             return None
         current_temp = round(celsius * 9 / 5 + 32, 2)
-        self._observation_cache[city.name] = current_temp
+        with self._scan_lock:
+            self._observation_cache[city.name] = current_temp
         return current_temp
 
     def _send_scan_summary(self, balance: float | None, total_checked: int, candidate_count: int) -> None:

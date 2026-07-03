@@ -578,15 +578,34 @@ class EdgeEngine:
     ) -> float:
         """Return the weighted combined signal score used before Claude."""
         ev_score = min(1.0, max(0.0, ev / 0.20))
-        signal_score = (
-            buffer_score * self.WEIGHT_BUFFER +
-            observation_score * self.WEIGHT_OBSERVATION +
-            confidence * self.WEIGHT_CONFIDENCE +
-            model_agreement * self.WEIGHT_MODEL_AGREEMENT +
-            ev_score * self.WEIGHT_EV +
-            imbalance_score * self.WEIGHT_IMBALANCE
+        contributions = {
+            "buffer": buffer_score * self.WEIGHT_BUFFER,
+            "obs": observation_score * self.WEIGHT_OBSERVATION,
+            "conf": confidence * self.WEIGHT_CONFIDENCE,
+            "agree": model_agreement * self.WEIGHT_MODEL_AGREEMENT,
+            "ev": ev_score * self.WEIGHT_EV,
+            "imb": imbalance_score * self.WEIGHT_IMBALANCE,
+        }
+        weights_sum = (
+            self.WEIGHT_BUFFER + self.WEIGHT_OBSERVATION + self.WEIGHT_CONFIDENCE
+            + self.WEIGHT_MODEL_AGREEMENT + self.WEIGHT_EV + self.WEIGHT_IMBALANCE
         )
-        return round(min(signal_score, 1.0), 3)
+        signal_score = round(min(sum(contributions.values()), 1.0), 3)
+        logging.debug(
+            "signal components ev=%.3f ev_score=%.3f | buffer=%.3f obs=%.3f conf=%.3f "
+            "agree=%.3f ev=%.3f imb=%.3f | weights_sum=%.2f => signal=%.3f",
+            ev,
+            ev_score,
+            contributions["buffer"],
+            contributions["obs"],
+            contributions["conf"],
+            contributions["agree"],
+            contributions["ev"],
+            contributions["imb"],
+            weights_sum,
+            signal_score,
+        )
+        return signal_score
 
     def _required_edge(self, market: KalshiMarket) -> float:
         """Return the market-specific minimum edge threshold."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -105,8 +106,14 @@ class WeatherClient:
             "ecmwf": int(os.getenv("EXPECTED_ECMWF_MEMBERS", "51")),
             "icon": int(os.getenv("EXPECTED_ICON_MEMBERS", "40")),
         }
-        self._cache: dict[tuple[str, str, str, str], tuple[EnsembleForecast, datetime]] = {}
-        self._cache_ttl = timedelta(minutes=10)
+        # Cache at (city, model, date) level — one fetch yields both HIGH and LOW
+        # member distributions, so KXHIGH/KXLOW/KXLOWT markets reuse the same call.
+        self._cache: dict[tuple[str, str, str], tuple[dict[str, EnsembleForecast], datetime]] = {}
+        self._cache_ttl = timedelta(minutes=20)
+        self._cache_lock = threading.Lock()
+        # Limit concurrent Open-Meteo HTTP calls so parallel scans do not trip
+        # the free-tier rate limit all at once.
+        self._api_semaphore = threading.Semaphore(int(os.getenv("OPEN_METEO_MAX_CONCURRENT", "3")))
 
     def watched_cities(self) -> list[CityConfig]:
         """Return the exact city list requested for scanning."""
@@ -127,21 +134,41 @@ class WeatherClient:
                 return city
         return None
 
+    def prewarm_cache(self, cities: list[CityConfig], target_date: date) -> None:
+        """Pre-fetch all ensemble data sequentially before market evaluation begins.
+
+        Fills the (city, model, date) cache once per scan cycle with a small
+        stagger between calls so the parallel evaluation phase hits cache instead
+        of hammering Open-Meteo. A 429 is logged and skipped (no aggressive retry);
+        affected cities fall back to fewer models for this cycle.
+        """
+        for city in cities:
+            for model_key in ("gfs", "ecmwf", "icon"):
+                self.get_ensemble_forecast(city, model_key, target_date, "high", retries=1)
+                time.sleep(0.3)
+
     def get_ensemble_forecast(
         self,
         city: CityConfig,
         model_key: str,
         target_date: date,
         market_type: str,
+        retries: int = 3,
     ) -> EnsembleForecast:
-        """Fetch a GFS, ECMWF, or ICON ensemble and reduce members to daily highs/lows."""
+        """Fetch a GFS, ECMWF, or ICON ensemble and reduce members to daily highs/lows.
+
+        Caches both the HIGH and LOW member distributions per (city, model, date)
+        so HIGH and LOW markets for the same city reuse a single API call.
+        """
         model_name = self.model_names[model_key]
-        cache_key = (city.name, model_key, str(target_date), market_type)
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            result, expires_at = cached
-            if datetime.now() < expires_at:
-                return result
+        cache_key = (city.name, model_key, str(target_date))
+        want = "high" if market_type == "high" else "low"
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                bundle, expires_at = cached
+                if datetime.now() < expires_at:
+                    return bundle[want]
 
         params = {
             "latitude": city.lat,
@@ -152,31 +179,39 @@ class WeatherClient:
             "models": model_name,
         }
         empty = EnsembleForecast(model_name, [], None, 0)
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
-                response = self.session.get(
-                    self.OPEN_METEO_ENSEMBLE_URL,
-                    params=params,
-                    timeout=30,
-                )
+                with self._api_semaphore:
+                    response = self.session.get(
+                        self.OPEN_METEO_ENSEMBLE_URL,
+                        params=params,
+                        timeout=30,
+                    )
                 if response.status_code == 429:
+                    if attempt >= retries - 1:
+                        logging.warning(
+                            "Open-Meteo rate limited for %s %s — skipping this cycle.",
+                            city.name,
+                            model_key,
+                        )
+                        return empty
                     wait = 2**attempt * 5
                     logging.warning("Open-Meteo rate limited, waiting %ds", wait)
                     time.sleep(wait)
                     continue
                 response.raise_for_status()
-                result = self._parse_ensemble_payload(
+                bundle = self._parse_ensemble_bundle(
                     response.json(),
                     model_name=model_name,
                     model_key=model_key,
                     target_date=target_date,
-                    market_type=market_type,
                     city=city,
                 )
-                self._cache[cache_key] = (result, datetime.now() + self._cache_ttl)
-                return result
+                with self._cache_lock:
+                    self._cache[cache_key] = (bundle, datetime.now() + self._cache_ttl)
+                return bundle[want]
             except Exception as exc:
-                if attempt == 2:
+                if attempt >= retries - 1:
                     logging.warning(
                         "Ensemble forecast failed for %s %s: %s",
                         city.name,
@@ -187,27 +222,43 @@ class WeatherClient:
                 time.sleep(2**attempt)
         return empty
 
-    def _parse_ensemble_payload(
+    def _parse_ensemble_bundle(
         self,
         payload: dict[str, Any],
         *,
         model_name: str,
         model_key: str,
         target_date: date,
-        market_type: str,
         city: CityConfig,
-    ) -> EnsembleForecast:
-        """Parse Open-Meteo ensemble JSON into daily member highs/lows."""
+    ) -> dict[str, EnsembleForecast]:
+        """Parse Open-Meteo ensemble JSON into both HIGH and LOW member distributions."""
         hourly = payload.get("hourly", {})
         times = hourly.get("time", [])
         member_series = self._extract_temperature_members(hourly)
 
-        daily_values = []
+        high_values: list[float] = []
+        low_values: list[float] = []
         for values in member_series:
-            daily_value = self._daily_high_or_low(times, values, target_date, market_type)
-            if daily_value is not None:
-                daily_values.append(daily_value)
+            high_value = self._daily_high_or_low(times, values, target_date, "high")
+            low_value = self._daily_high_or_low(times, values, target_date, "low")
+            if high_value is not None:
+                high_values.append(high_value)
+            if low_value is not None:
+                low_values.append(low_value)
 
+        return {
+            "high": self._build_forecast(model_name, model_key, city, high_values),
+            "low": self._build_forecast(model_name, model_key, city, low_values),
+        }
+
+    def _build_forecast(
+        self,
+        model_name: str,
+        model_key: str,
+        city: CityConfig,
+        daily_values: list[float],
+    ) -> EnsembleForecast:
+        """Build an EnsembleForecast and warn when member count is below expected."""
         member_count = len(daily_values)
         expected = self.expected_members.get(model_key)
         if expected is not None and member_count < expected:
@@ -218,7 +269,6 @@ class WeatherClient:
                 city.name,
                 expected,
             )
-
         mean_temp = round(sum(daily_values) / member_count, 2) if daily_values else None
         return EnsembleForecast(model_name, daily_values, mean_temp, member_count)
 
