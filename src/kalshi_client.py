@@ -41,6 +41,9 @@ class KalshiClient:
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
     PROD_URL = "https://trading-api.kalshi.com/trade-api/v2"
 
+    # Kalshi returns "active" for open tradeable markets; accept "open" too.
+    TRADEABLE_STATUSES = {"active", "open"}
+
     def __init__(self) -> None:
         """Create one reusable HTTP session and read credentials from env vars."""
         self.env = os.getenv("KALSHI_ENV", "demo").strip().lower()
@@ -99,7 +102,8 @@ class KalshiClient:
         # Full raw response for diagnosis of status/close_time handling.
         logging.info("[MARKET STATUS] %s raw response: %s", ticker, json.dumps(data, default=str))
 
-        if status == "open":
+        # Kalshi returns "active" for open tradeable markets; accept "open" too.
+        if status in self.TRADEABLE_STATUSES:
             return True
 
         if status == "settled":
@@ -118,7 +122,7 @@ class KalshiClient:
             )
         else:
             logging.info(
-                "[SKIP] Market %s not open | status=%s close_time=%s",
+                "[SKIP] Market %s not tradeable | status=%s close_time=%s",
                 ticker,
                 status or "(empty)",
                 close_time,
