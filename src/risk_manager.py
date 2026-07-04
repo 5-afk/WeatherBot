@@ -345,11 +345,16 @@ class RiskManager:
         return float(row[0])
 
     def opened_notional_today(self) -> float:
-        """Calculate today's total deployed stake."""
+        """Sum stakes for open live positions opened today only."""
         today = datetime.now(timezone.utc).date().isoformat()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COALESCE(SUM(stake), 0) FROM positions WHERE DATE(opened_at) = ?",
+                """
+                SELECT COALESCE(SUM(stake), 0) FROM positions
+                WHERE DATE(opened_at) = ?
+                  AND status = 'open'
+                  AND dry_run = 0
+                """,
                 (today,),
             ).fetchone()
         return float(row[0])

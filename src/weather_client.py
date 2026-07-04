@@ -30,6 +30,9 @@ _LOCATION_TO_STATION: dict[str, str] = {
     "hartsfield": "KATL",
     "boston logan": "KBOS",
     "reagan national": "KDCA",
+    "ronald reagan": "KDCA",
+    "washington dc": "KDCA",
+    "national airport": "KDCA",
     "dulles": "KIAD",
 }
 
