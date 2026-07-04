@@ -330,6 +330,19 @@ class BotLauncher:
                 return
             await ctx.send(report)
 
+        @self.bot.command(name="clearhalt")
+        async def clearhalt_cmd(ctx):
+            """Clear permanent halt and reset drawdown tracking to current balance."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            await ctx.send("🔄 Clearing halt and resetting drawdown tracking...")
+            try:
+                report = launcher._clear_halt_and_reset_drawdown()
+            except Exception as exc:
+                await ctx.send(f"⚠️ Clear halt failed: {exc}")
+                return
+            await ctx.send(report)
+
         @self.bot.command(name="positions")
         async def positions_cmd(ctx):
             """Show currently open positions fetched live from Kalshi with P&L."""
@@ -428,6 +441,7 @@ class BotLauncher:
                 "!positions — show open positions with live P&L\n"
                 "!syncpositions — sync open Kalshi positions into local DB\n"
                 "!resetstate — sync cash balance and close settled positions\n"
+                "!clearhalt — clear permanent halt and reset drawdown to current balance\n"
                 "!logs    — show last 30 log lines\n"
                 "!logsfull — upload full log file\n"
                 "!logssince [hours] — upload recent logs\n"
@@ -475,7 +489,7 @@ class BotLauncher:
 
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
-            "status", "balance", "positions", "syncpositions", "resetstate", "logs", "logsfull",
+            "status", "balance", "positions", "syncpositions", "resetstate", "clearhalt", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }
         registered = {command.name for command in self.bot.commands}
@@ -609,6 +623,8 @@ class BotLauncher:
         client = KalshiClient()
         risk = RiskManager(PROJECT_ROOT / "data" / "positions.db")
         report = risk.sync_from_kalshi(client)
+        real_balance = float(report["cash"])
+        tracking = self._reset_risk_tracking(real_balance)
 
         lines = [
             "🔄 State Reset Complete",
@@ -627,7 +643,73 @@ class BotLauncher:
         if report["positions_value"] > 0:
             lines.append(f"Open position value: ${report['positions_value']:.2f}")
             lines.append(f"Total portfolio: ${report['total']:.2f}")
+        lines.extend(tracking)
         return "\n".join(lines)
+
+    def _clear_halt_and_reset_drawdown(self) -> str:
+        """Clear permanent halt and rebaseline drawdown to the live Kalshi balance."""
+        client = KalshiClient()
+        real_balance = client.get_balance()
+        if real_balance is None:
+            raise RuntimeError("Could not fetch Kalshi balance")
+        was_halted = self._risk_state_value("permanent_halt") == "true"
+        tracking = self._reset_risk_tracking(real_balance)
+        lines = [
+            "✅ Halt Cleared",
+            f"Kalshi balance: ${real_balance:.2f}",
+            f"Permanent halt was active: {'Yes' if was_halted else 'No'}",
+        ]
+        lines.extend(tracking)
+        return "\n".join(lines)
+
+    def _reset_risk_tracking(self, real_balance: float) -> list[str]:
+        """Reset P&L/drawdown risk_state keys for a fresh start at the current balance."""
+        balance_str = str(round(real_balance, 2))
+        db_path = PROJECT_ROOT / "data" / "positions.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO risk_state (key, value) VALUES ('total_loss_today', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO risk_state (key, value) VALUES ('total_loss_month', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO risk_state (key, value) VALUES ('permanent_halt', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO risk_state (key, value) VALUES ('manual_restart_required', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO risk_state (key, value) VALUES ('peak_balance', ?)",
+                (balance_str,),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO risk_state (key, value) VALUES ('running_budget', ?)",
+                (balance_str,),
+            )
+            conn.execute("DELETE FROM pnl")
+        return [
+            "P&L tracking reset for fresh start:",
+            "  permanent_halt → cleared",
+            "  total_loss_today → $0.00",
+            "  total_loss_month → $0.00",
+            f"  peak_balance → ${real_balance:.2f}",
+            f"  running_budget → ${real_balance:.2f}",
+            "  stale pnl records → cleared",
+        ]
+
+    def _risk_state_value(self, key: str, default: str = "") -> str:
+        """Read a string value from the risk_state table."""
+        db_path = PROJECT_ROOT / "data" / "positions.db"
+        if not db_path.exists():
+            return default
+        try:
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute("SELECT value FROM risk_state WHERE key = ?", (key,)).fetchone()
+            return default if row is None else str(row[0])
+        except Exception:
+            return default
 
     def _open_positions_report(self) -> str:
         """Build a Discord-friendly report of live open positions with P&L."""

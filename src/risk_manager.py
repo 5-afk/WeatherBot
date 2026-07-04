@@ -361,7 +361,14 @@ class RiskManager:
         return self.starting_balance + float(row[0])
 
     def drawdown_pct(self) -> float:
-        """Return account drawdown from the configured starting balance."""
+        """Return drawdown from peak balance to the current running budget."""
+        peak_raw = self._get_state("peak_balance")
+        if peak_raw is not None:
+            peak = float(peak_raw)
+            current = float(self._get_state("running_budget") or self.starting_balance)
+            if peak <= 0:
+                return 0.0
+            return max(0.0, (peak - current) / peak)
         if self.starting_balance <= 0:
             return 0.0
         return max(0.0, (self.starting_balance - self.current_balance()) / self.starting_balance)
