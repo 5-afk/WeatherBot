@@ -14,39 +14,33 @@ from zoneinfo import ZoneInfo
 import requests
 
 
-# Station mappings — must match the exact NWS station each Kalshi market settles on.
-KALSHI_SETTLEMENT_STATIONS: dict[str, str] = {
-    "New York": "KNYC",       # Central Park
-    "Chicago": "KMDW",        # Midway Airport
-    "Miami": "KMIA",          # Miami International Airport
-    "Los Angeles": "KLAX",    # Los Angeles International Airport
-    "Denver": "KDEN",         # Denver International Airport
-    "Seattle": "KSEA",       # Seattle-Tacoma International Airport
-    "San Francisco": "KSFO",  # San Francisco International Airport
-    "Dallas": "KDFW",         # Dallas/Fort Worth International Airport
-    "Minneapolis": "KMSP",    # Minneapolis-St Paul International Airport
-    "Oklahoma City": "KOKC",  # Will Rogers World Airport
-    "Atlanta": "KATL",        # Hartsfield-Jackson Atlanta International Airport
-    "Boston": "KBOS",        # Boston Logan International Airport
-    "Washington DC": "KDCA",  # Reagan National Airport
+# Fallback location-name substrings in Kalshi rules_primary -> ICAO station codes.
+_LOCATION_TO_STATION: dict[str, str] = {
+    "los angeles airport": "KLAX",
+    "central park": "KNYC",
+    "chicago midway": "KMDW",
+    "miami international": "KMIA",
+    "denver international": "KDEN",
+    "denver": "KDEN",
+    "seattle-tacoma": "KSEA",
+    "san francisco international": "KSFO",
+    "dallas/fort worth": "KDFW",
+    "minneapolis": "KMSP",
+    "oklahoma city": "KOKC",
+    "hartsfield": "KATL",
+    "boston logan": "KBOS",
+    "reagan national": "KDCA",
+    "dulles": "KIAD",
 }
 
-# Substrings expected in Kalshi rules_primary for each settlement station.
-_SETTLEMENT_RULE_HINTS: dict[str, list[str]] = {
-    "New York": ["Central Park", "KNYC", "New York City"],
-    "Chicago": ["Midway", "KMDW", "Chicago"],
-    "Miami": ["Miami", "KMIA"],
-    "Los Angeles": ["Los Angeles Airport", "KLAX", "Los Angeles International"],
-    "Denver": ["Denver", "KDEN"],
-    "Seattle": ["Seattle", "KSEA", "Sea-Tac"],
-    "San Francisco": ["San Francisco", "KSFO"],
-    "Dallas": ["Dallas", "KDFW", "Fort Worth", "DFW"],
-    "Minneapolis": ["Minneapolis", "KMSP"],
-    "Oklahoma City": ["Oklahoma City", "KOKC"],
-    "Atlanta": ["Atlanta", "KATL"],
-    "Boston": ["Boston", "KBOS", "Logan"],
-    "Washington DC": ["Reagan", "KDCA", "Washington", "National Airport"],
-}
+# Series tickers used for startup contract-driven station verification.
+_VERIFY_SERIES_EXPECTED: list[tuple[str, str]] = [
+    ("KXHIGHLAX", "KLAX"),
+    ("KXHIGHNY", "KNYC"),
+    ("KXHIGHCHI", "KMDW"),
+    ("KXHIGHMIA", "KMIA"),
+    ("KXHIGHDEN", "KDEN"),
+]
 
 
 @dataclass(frozen=True)
@@ -82,11 +76,6 @@ class CityConfig:
         """Return a short city code for compact logs."""
         return self.ticker.replace("KXHIGH", "")
 
-    @property
-    def settlement_station(self) -> str:
-        """Return the ICAO station ID Kalshi uses to settle this city's markets."""
-        return KALSHI_SETTLEMENT_STATIONS.get(self.name, self.nws_station)
-
 
 @dataclass(frozen=True)
 class NwsForecast:
@@ -97,31 +86,38 @@ class NwsForecast:
     source: str
 
 
-def _city(name: str, ticker: str, lat: float, lon: float, tz: str, **kwargs: float) -> CityConfig:
-    """Build a CityConfig with the canonical settlement station for the city."""
-    station = KALSHI_SETTLEMENT_STATIONS[name]
-    return CityConfig(name, ticker, lat, lon, station, tz, **kwargs)
+def _city(
+    name: str,
+    ticker: str,
+    lat: float,
+    lon: float,
+    nws_station: str,
+    tz: str,
+    **kwargs: float,
+) -> CityConfig:
+    """Build a CityConfig; nws_station is the default NWS station for diagnostics only."""
+    return CityConfig(name, ticker, lat, lon, nws_station, tz, **kwargs)
 
 
 # Original 5 cities — kept first so CITY_COUNT=5 selects exactly these.
 ORIGINAL_CITIES: dict[str, CityConfig] = {
-    "New York": _city("New York", "KXHIGHNY", 40.7128, -74.0060, "America/New_York", nws_bias_f=-1.5),
-    "Chicago": _city("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "America/Chicago", nws_bias_f=-1.5),
-    "Miami": _city("Miami", "KXHIGHMIA", 25.7617, -80.1918, "America/New_York", nws_bias_f=-1.5),
-    "Los Angeles": _city("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "America/Los_Angeles", nws_bias_f=-1.5),
-    "Denver": _city("Denver", "KXHIGHDEN", 39.7392, -104.9903, "America/Denver", nws_bias_f=-1.5),
+    "New York": _city("New York", "KXHIGHNY", 40.7128, -74.0060, "KNYC", "America/New_York", nws_bias_f=-1.5),
+    "Chicago": _city("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "KMDW", "America/Chicago", nws_bias_f=-1.5),
+    "Miami": _city("Miami", "KXHIGHMIA", 25.7617, -80.1918, "KMIA", "America/New_York", nws_bias_f=-1.5),
+    "Los Angeles": _city("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "KLAX", "America/Los_Angeles", nws_bias_f=-1.5),
+    "Denver": _city("Denver", "KXHIGHDEN", 39.7392, -104.9903, "KDEN", "America/Denver", nws_bias_f=-1.5),
 }
 
 # 8 expansion cities — enabled when CITY_COUNT >= 13.
 EXTENDED_CITIES: dict[str, CityConfig] = {
-    "Seattle": _city("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "America/Los_Angeles", nws_bias_f=-1.0),
-    "San Francisco": _city("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "America/Los_Angeles", nws_bias_f=-1.0),
-    "Dallas": _city("Dallas", "KXHIGHTDAL", 32.7767, -96.7970, "America/Chicago", nws_bias_f=-1.5),
-    "Minneapolis": _city("Minneapolis", "KXHIGHTMIN", 44.9778, -93.2650, "America/Chicago", nws_bias_f=-1.5),
-    "Oklahoma City": _city("Oklahoma City", "KXHIGHTOKC", 35.4676, -97.5164, "America/Chicago", nws_bias_f=-1.5),
-    "Atlanta": _city("Atlanta", "KXHIGHTATL", 33.7490, -84.3880, "America/New_York", nws_bias_f=-1.5),
-    "Boston": _city("Boston", "KXHIGHTBOS", 42.3601, -71.0589, "America/New_York", nws_bias_f=-1.5),
-    "Washington DC": _city("Washington DC", "KXHIGHTDC", 38.9072, -77.0369, "America/New_York", nws_bias_f=-1.5),
+    "Seattle": _city("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "KSEA", "America/Los_Angeles", nws_bias_f=-1.0),
+    "San Francisco": _city("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "KSFO", "America/Los_Angeles", nws_bias_f=-1.0),
+    "Dallas": _city("Dallas", "KXHIGHTDAL", 32.7767, -96.7970, "KDFW", "America/Chicago", nws_bias_f=-1.5),
+    "Minneapolis": _city("Minneapolis", "KXHIGHTMIN", 44.9778, -93.2650, "KMSP", "America/Chicago", nws_bias_f=-1.5),
+    "Oklahoma City": _city("Oklahoma City", "KXHIGHTOKC", 35.4676, -97.5164, "KOKC", "America/Chicago", nws_bias_f=-1.5),
+    "Atlanta": _city("Atlanta", "KXHIGHTATL", 33.7490, -84.3880, "KATL", "America/New_York", nws_bias_f=-1.5),
+    "Boston": _city("Boston", "KXHIGHTBOS", 42.3601, -71.0589, "KBOS", "America/New_York", nws_bias_f=-1.5),
+    "Washington DC": _city("Washington DC", "KXHIGHTDC", 38.9072, -77.0369, "KDCA", "America/New_York", nws_bias_f=-1.5),
 }
 
 CITIES: dict[str, CityConfig] = {**ORIGINAL_CITIES, **EXTENDED_CITIES}
@@ -131,7 +127,6 @@ class WeatherClient:
     """Fetch and normalize weather data from free NWS public APIs."""
 
     NWS_BASE_URL = "https://api.weather.gov"
-    _ICAO_RE = re.compile(r"\bK[A-Z]{3}\b")
 
     def __init__(self) -> None:
         """Create an HTTP session and read API-related settings from env vars."""
@@ -172,19 +167,43 @@ class WeatherClient:
                 return city
         return None
 
+    def parse_settlement_station(self, rules_primary: str) -> str | None:
+        """Extract the ICAO station code from contract rules text.
+
+        Looks for patterns like:
+        - "Los Angeles Airport, CA" -> KLAX
+        - "Central Park" -> KNYC
+        - "Chicago Midway" -> KMDW
+        - "Denver International" -> KDEN
+        - direct ICAO codes like "KLAX" or "KNYC"
+
+        Returns ICAO code or None if not found.
+        """
+        icao_match = re.search(r"\b(K[A-Z]{3})\b", rules_primary)
+        if icao_match:
+            return icao_match.group(1)
+
+        rules_lower = rules_primary.lower()
+        for location, station in _LOCATION_TO_STATION.items():
+            if location in rules_lower:
+                return station
+
+        return None
+
     def get_station_forecast(
         self,
-        city: CityConfig,
+        station_id: str,
         target_date: date,
         market_type: str,
+        *,
+        city: CityConfig,
     ) -> NwsForecast:
-        """Return NWS hourly forecast high/low for the city's settlement station.
+        """Return NWS hourly forecast high/low for a specific settlement station.
 
         Resolves the gridpoint from the station's own coordinates (not the city's
         general area lat/lon), then extracts peak heating / overnight low windows
         in the city's local timezone.
         """
-        station_id = city.settlement_station
         want = "high" if market_type.lower() == "high" else "low"
         cache_key = (station_id, str(target_date))
         with self._cache_lock:
@@ -219,54 +238,63 @@ class WeatherClient:
             logging.warning("Station forecast temp failed for %s: %s", station_id, exc)
             return None
 
-    def verify_settlement_stations(self, kalshi_client: Any) -> None:
-        """One-time startup check: confirm our station map matches Kalshi rules_primary."""
-        logging.info("Verifying settlement station mappings against Kalshi market rules...")
-        for city in self.watched_cities():
-            station = city.settlement_station
+    def verify_contract_driven_station_parsing(self, kalshi_client: Any) -> bool:
+        """Startup check: parse settlement stations from live Kalshi contract rules."""
+        logging.info("Verifying contract-driven settlement station parsing...")
+        all_passed = True
+        for series_ticker, expected_station in _VERIFY_SERIES_EXPECTED:
             try:
                 payload = kalshi_client._request(
                     "GET",
                     "/markets",
-                    params={"series_ticker": city.high_series, "status": "open", "limit": 1},
+                    params={"series_ticker": series_ticker, "status": "open", "limit": 1},
                     auth_required=False,
                 )
                 markets = payload.get("markets", [])
                 if not markets:
-                    logging.warning("Settlement verify: no open market for %s (%s)", city.name, city.high_series)
+                    logging.warning("Station verify: no open market for %s", series_ticker)
+                    all_passed = False
                     continue
-                rules = str(markets[0].get("rules_primary", ""))
-                hints = _SETTLEMENT_RULE_HINTS.get(city.name, [station])
-                matched = any(hint.lower() in rules.lower() for hint in hints)
-                icao_in_rules = self._ICAO_RE.findall(rules.upper())
-                if icao_in_rules and station not in icao_in_rules:
-                    logging.critical(
-                        "SETTLEMENT STATION MISMATCH %s: configured %s but rules_primary mentions %s | rules=%s",
-                        city.name,
-                        station,
-                        icao_in_rules,
-                        rules[:200],
-                    )
-                elif not matched:
-                    logging.critical(
-                        "SETTLEMENT STATION UNVERIFIED %s: expected hints %s not found in rules_primary | rules=%s",
-                        city.name,
-                        hints,
-                        rules[:200],
-                    )
+                market = markets[0]
+                ticker = str(market.get("ticker", ""))
+                rules_primary = str(market.get("rules_primary", ""))
+                if not rules_primary and hasattr(kalshi_client, "get_market_rules"):
+                    rules_primary = str(kalshi_client.get_market_rules(ticker).get("rules_primary", ""))
+                parsed = self.parse_settlement_station(rules_primary)
+                if parsed == expected_station:
+                    logging.info("[VERIFY] %s rules -> %s ✓", ticker, parsed)
                 else:
-                    logging.info("Settlement station verified: %s -> %s", city.name, station)
+                    all_passed = False
+                    logging.warning(
+                        "[VERIFY] %s rules -> %s (expected %s) | rules=%s",
+                        ticker,
+                        parsed,
+                        expected_station,
+                        rules_primary[:200],
+                    )
             except Exception as exc:
-                logging.warning("Settlement verify failed for %s: %s", city.name, exc)
+                all_passed = False
+                logging.warning("Station verify failed for %s: %s", series_ticker, exc)
 
-    def log_forecast_vs_observation(self, city: CityConfig, target_date: date | None = None) -> None:
+        if all_passed:
+            msg = "CONTRACT-DRIVEN STATION PARSING VERIFIED ✅"
+            logging.info(msg)
+            print(msg)
+        return all_passed
+
+    def log_forecast_vs_observation(
+        self,
+        city: CityConfig,
+        *,
+        station_id: str,
+        target_date: date | None = None,
+    ) -> None:
         """Log station forecast vs latest METAR for diagnostics (e.g. KLAX sanity check)."""
-        station_id = city.settlement_station
         target_date = target_date or datetime.now(ZoneInfo(city.tz)).date()
         forecast_high = self.get_station_forecast_temp(station_id, target_date, "high", city.tz)
         forecast_low = self.get_station_forecast_temp(station_id, target_date, "low", city.tz)
 
-        obs = self.latest_station_observation(city)
+        obs = self.latest_station_observation(station_id)
         obs_temp_c: float | None = None
         if obs:
             obs_temp_c = self._safe_float((obs.get("properties") or {}).get("temperature", {}).get("value"))
@@ -485,9 +513,8 @@ class WeatherClient:
         low_bias = city.nws_low_bias_f if city.nws_low_bias_f else self.nws_low_bias_f
         return round(temperature + low_bias, 2)
 
-    def latest_station_observation(self, city: CityConfig) -> dict[str, Any] | None:
+    def latest_station_observation(self, station_id: str) -> dict[str, Any] | None:
         """Fetch the latest station observation for debugging and audit logs."""
-        station_id = city.settlement_station
         url = f"{self.NWS_BASE_URL}/stations/{station_id}/observations/latest"
         try:
             response = self.session.get(url, headers=self._nws_headers, timeout=self.timeout_seconds)

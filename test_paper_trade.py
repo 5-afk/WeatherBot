@@ -39,6 +39,10 @@ def build_mock_markets() -> list[dict[str, object]]:
             "no_bid_dollars": 0.33,
             "close_time": (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat(),
             "settlement_time": (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat(),
+            "rules_primary": (
+                "If the highest temperature recorded in Central Park, New York, NY "
+                "for the settlement date is at or above the threshold..."
+            ),
         },
         {
             "ticker": "KXHIGHCHI-26JUN28-B80",
@@ -51,6 +55,10 @@ def build_mock_markets() -> list[dict[str, object]]:
             "no_bid_dollars": 0.56,
             "close_time": (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat(),
             "settlement_time": (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat(),
+            "rules_primary": (
+                "If the highest temperature recorded at Chicago Midway Airport, IL "
+                "for the settlement date is at or above the threshold..."
+            ),
         },
         {
             "ticker": "KXHIGHMIA-26JUN28-B88",
@@ -63,6 +71,10 @@ def build_mock_markets() -> list[dict[str, object]]:
             "no_bid_dollars": 0.43,
             "close_time": (datetime.now(timezone.utc) + timedelta(hours=16)).isoformat(),
             "settlement_time": (datetime.now(timezone.utc) + timedelta(hours=16)).isoformat(),
+            "rules_primary": (
+                "If the highest temperature recorded at Miami International Airport, FL "
+                "for the settlement date is at or above the threshold..."
+            ),
         },
     ]
 
@@ -203,8 +215,17 @@ def main() -> None:
         market_type = edge_engine.market_type(market)
         target_date = settlement_time.astimezone(timezone.utc).date()
 
+        rules_primary = str(market.raw.get("rules_primary", ""))
+        settlement_station = weather.parse_settlement_station(rules_primary)
+        if not settlement_station:
+            print(
+                f"\nMarket: {market.ticker}\nCity: {city.name}\n"
+                "Would bet: NO\nReason: Could not determine settlement station from rules."
+            )
+            continue
+
         try:
-            nws = weather.get_station_forecast(city, target_date, market_type)
+            nws = weather.get_station_forecast(settlement_station, target_date, market_type, city=city)
         except Exception as exc:
             print(f"\nMarket: {market.ticker}\nCity: {city.name}\nWould bet: NO\nReason: Weather fetch failed: {exc}")
             continue

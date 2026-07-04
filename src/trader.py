@@ -116,13 +116,17 @@ class Trader:
             logging.info("Dry run — skipping Kalshi state sync")
         self._ensure_pnl_file()
         try:
-            self.weather.verify_settlement_stations(self.kalshi)
+            self.weather.verify_contract_driven_station_parsing(self.kalshi)
         except Exception as exc:
-            logging.warning("Settlement station verification failed: %s", exc)
+            logging.warning("Contract-driven station verification failed: %s", exc)
         lax = self.weather.city_for_market("KXHIGHLAX")
         if lax is not None:
             try:
-                self.weather.log_forecast_vs_observation(lax)
+                lax_markets = self.kalshi.list_markets(lax.high_series, limit=1)
+                if lax_markets:
+                    rules_primary = self._rules_primary_for_market(lax_markets[0])
+                    station_id = self.weather.parse_settlement_station(rules_primary) or lax.nws_station
+                    self.weather.log_forecast_vs_observation(lax, station_id=station_id)
             except Exception as exc:
                 logging.warning("KLAX forecast vs observation check failed: %s", exc)
 
@@ -287,12 +291,22 @@ class Trader:
 
         market_type = self.edge_engine.market_type(market)
         target_date = settlement_time.astimezone(timezone.utc).date()
-        cache_key = (city.name, target_date.isoformat(), market_type)
+
+        rules_primary = self._rules_primary_for_market(market)
+        settlement_station = self.weather.parse_settlement_station(rules_primary)
+        if not settlement_station:
+            logging.warning("[SKIP] %s — could not determine settlement station from rules", market.ticker)
+            self._log_skip(city, market, "Could not determine settlement station from rules.", None)
+            return None
+
+        cache_key = (settlement_station, target_date.isoformat(), market_type)
         try:
             with self._scan_lock:
                 cached_weather = self._weather_cache.get(cache_key)
             if cached_weather is None:
-                nws = self.weather.get_station_forecast(city, target_date, market_type)
+                nws = self.weather.get_station_forecast(
+                    settlement_station, target_date, market_type, city=city
+                )
                 with self._scan_lock:
                     if cache_key not in self._weather_cache:
                         self._weather_cache[cache_key] = nws
@@ -304,7 +318,18 @@ class Trader:
             self._log_skip(city, market, f"Weather fetch failed: {exc}", None)
             return None
 
-        current_temp_f = self._current_temp_f(city)
+        if nws.temperature_f is None:
+            logging.warning("[SKIP] %s — no forecast available for station %s", market.ticker, settlement_station)
+            self._log_skip(city, market, f"No forecast available for station {settlement_station}.", None)
+            return None
+        logging.debug(
+            "[STATION] %s using %s forecast=%.1f°F",
+            market.ticker,
+            settlement_station,
+            nws.temperature_f,
+        )
+
+        current_temp_f = self._current_temp_f(settlement_station)
         imbalance_score = self._fetch_imbalance(market)
         edge = self.edge_engine.evaluate(
             market,
@@ -386,6 +411,13 @@ class Trader:
         except Exception:
             return 0.5
 
+    def _rules_primary_for_market(self, market: KalshiMarket) -> str:
+        """Return rules_primary from list payload or fall back to a per-ticker fetch."""
+        rules_primary = str(market.raw.get("rules_primary", ""))
+        if rules_primary:
+            return rules_primary
+        return str(self.kalshi.get_market_rules(market.ticker).get("rules_primary", ""))
+
     def _batch_candidate_payload(
         self,
         city: CityConfig,
@@ -394,10 +426,13 @@ class Trader:
     ) -> dict[str, Any]:
         """Build one candidate row for the single Claude batch call."""
         settlement = market.settlement_time or market.close_time
-        market_rules = self.kalshi.get_market_rules(
-            market.ticker,
-            settlement_station=city.settlement_station,
-        )
+        rules_primary = self._rules_primary_for_market(market)
+        settlement_station = self.weather.parse_settlement_station(rules_primary) or ""
+        market_rules = self.kalshi.get_market_rules(market.ticker)
+        if not rules_primary:
+            rules_primary = str(market_rules.get("rules_primary", ""))
+            if not settlement_station:
+                settlement_station = self.weather.parse_settlement_station(rules_primary) or ""
         return {
             "ticker": market.ticker,
             "city": city.name,
@@ -416,9 +451,9 @@ class Trader:
             "nws_forecast_f": edge.nws_forecast_temperature_f,
             "hours_until_settlement": edge.hours_until_settlement,
             "settlement": settlement.isoformat() if settlement else None,
-            "rules_primary": market_rules.get("rules_primary", ""),
+            "rules_primary": rules_primary,
             "expiration_time": market_rules.get("expiration_time", ""),
-            "settlement_station": market_rules.get("settlement_station", ""),
+            "settlement_station": settlement_station,
             "last_trading_time": market_rules.get("close_time", ""),
         }
 
@@ -436,15 +471,15 @@ class Trader:
             logging.warning("Claude selected unknown ticker %s — using top signal", ticker)
         return candidates[0]
 
-    def _current_temp_f(self, city: CityConfig) -> float | None:
+    def _current_temp_f(self, settlement_station: str) -> float | None:
         """Fetch latest station temperature from NWS and convert Celsius to Fahrenheit."""
         with self._scan_lock:
-            if city.name in self._observation_cache:
-                return self._observation_cache[city.name]
-        observation = self.weather.latest_station_observation(city)
+            if settlement_station in self._observation_cache:
+                return self._observation_cache[settlement_station]
+        observation = self.weather.latest_station_observation(settlement_station)
         if not observation:
             with self._scan_lock:
-                self._observation_cache[city.name] = None
+                self._observation_cache[settlement_station] = None
             return None
         value = (
             observation.get("properties", {})
@@ -455,11 +490,11 @@ class Trader:
             celsius = float(value)
         except (TypeError, ValueError):
             with self._scan_lock:
-                self._observation_cache[city.name] = None
+                self._observation_cache[settlement_station] = None
             return None
         current_temp = round(celsius * 9 / 5 + 32, 2)
         with self._scan_lock:
-            self._observation_cache[city.name] = current_temp
+            self._observation_cache[settlement_station] = current_temp
         return current_temp
 
     def _send_scan_summary(self, balance: float | None, total_checked: int, candidate_count: int) -> None:
