@@ -89,7 +89,19 @@ class EdgeEngine:
         self.denver_min_edge = float(os.getenv("DENVER_MIN_EDGE", "0.15"))
         self.settlement_window_hours = float(os.getenv("SETTLEMENT_WINDOW_HOURS", "36"))
         self.no_side_bias = float(os.getenv("NO_SIDE_BIAS", "1.15"))
-        logging.info("EdgeEngine MIN_EV_PER_CONTRACT=%.4f NO_SIDE_BIAS=%.2f", self.min_ev_per_contract, self.no_side_bias)
+        self.min_liquidity = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "10"))
+        self.min_liquidity_new_city = float(os.getenv("MIN_LIQUIDITY_NEW_CITY", "10"))
+        self._expansion_series = {
+            "KXHIGHTSEA", "KXHIGHTSFO", "KXHIGHTDAL", "KXHIGHTMIN",
+            "KXHIGHTOKC", "KXHIGHTATL", "KXHIGHTBOS", "KXHIGHTDC",
+        }
+        logging.info(
+            "EdgeEngine MIN_EV=%.4f NO_SIDE_BIAS=%.2f MIN_LIQ=%.0f NEW_CITY_LIQ=%.0f",
+            self.min_ev_per_contract,
+            self.no_side_bias,
+            self.min_liquidity,
+            self.min_liquidity_new_city,
+        )
 
     def evaluate(
         self,
@@ -157,6 +169,9 @@ class EdgeEngine:
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
+            strike_type=strike_type,
+            floor_strike=lower_threshold if strike_type == "between" else None,
+            cap_strike=upper_threshold if strike_type == "between" else None,
         )
         no_decision = self._evaluate_side(
             market,
@@ -169,13 +184,33 @@ class EdgeEngine:
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
+            strike_type=strike_type,
+            floor_strike=lower_threshold if strike_type == "between" else None,
+            cap_strike=upper_threshold if strike_type == "between" else None,
         )
 
         passing = [d for d in (yes_decision, no_decision) if d.should_trade]
         if passing:
-            return max(passing, key=lambda d: d.ev or -999.0)
+            return max(passing, key=lambda d: (0 if d.side == "no" else 1, -(d.ev or 0.0)))
+
+        yes_wrong_side = (
+            not yes_decision.should_trade
+            and "wrong side of threshold" in yes_decision.reason.lower()
+        )
+        if yes_wrong_side and no_decision.should_trade:
+            return no_decision
+        if yes_wrong_side and no_decision.ev is not None and no_decision.buffer_score > 0:
+            logging.debug(
+                "YES buffer failed for %s — NO side ev=%.4f buffer=%.2f reason=%s",
+                market.ticker,
+                no_decision.ev,
+                no_decision.buffer_score,
+                no_decision.reason,
+            )
 
         candidates = [yes_decision, no_decision]
+        if yes_wrong_side:
+            return max(candidates, key=lambda d: (0 if d.side == "no" else 1, d.ev if d.ev is not None else -999.0))
         return max(candidates, key=lambda d: d.ev if d.ev is not None else -999.0)
 
     def _evaluate_side(
@@ -191,6 +226,9 @@ class EdgeEngine:
         current_temp_f: float | None,
         ladder_multiplier: float,
         imbalance_score: float,
+        strike_type: str = "greater",
+        floor_strike: float | None = None,
+        cap_strike: float | None = None,
     ) -> EdgeDecision:
         """Evaluate one side (yes or no) through all gates."""
         ask_price = market.yes_ask if side == "yes" else market.no_ask
@@ -237,7 +275,15 @@ class EdgeEngine:
                 ladder_multiplier=ladder_multiplier,
             )
 
-        buffer_score = self._temperature_buffer_score(nws_temp, threshold, market_type, side)
+        buffer_score = self._temperature_buffer_score(
+            nws_temp,
+            threshold,
+            market_type,
+            side,
+            strike_type=strike_type,
+            floor_strike=floor_strike,
+            cap_strike=cap_strike,
+        )
         if buffer_score == 0.0:
             return EdgeDecision(
                 False,
@@ -260,7 +306,15 @@ class EdgeEngine:
                 None,
                 imbalance_score,
             )
-        if not self._nws_agrees(nws_temp, threshold, market_type, side):
+        if not self._nws_agrees(
+            nws_temp,
+            threshold,
+            market_type,
+            side,
+            strike_type=strike_type,
+            floor_strike=floor_strike,
+            cap_strike=cap_strike,
+        ):
             return EdgeDecision(
                 False,
                 side,
@@ -499,14 +553,39 @@ class EdgeEngine:
         threshold: float,
         market_type: str,
         side: str,
+        *,
+        strike_type: str = "greater",
+        floor_strike: float | None = None,
+        cap_strike: float | None = None,
     ) -> float:
-        """Score 0.0-1.0 based on how far the forecast is from the threshold."""
+        """Score 0.0-1.0 based on how far the forecast favors this side.
+
+        For HIGH greater markets: YES needs forecast above threshold, NO below.
+        For between brackets: YES needs forecast inside [floor, cap], NO outside.
+        """
         if nws_temp is None:
             return 0.5
-        if market_type == "high":
+
+        if strike_type == "between" and floor_strike is not None and cap_strike is not None:
+            floor, cap = floor_strike, cap_strike
+            inside = floor <= nws_temp <= cap
+            if side == "yes":
+                if inside:
+                    buffer = min(nws_temp - floor, cap - nws_temp)
+                elif nws_temp < floor:
+                    buffer = nws_temp - floor
+                else:
+                    buffer = cap - nws_temp
+            else:
+                if not inside:
+                    buffer = (floor - nws_temp) if nws_temp < floor else (nws_temp - cap)
+                else:
+                    buffer = -min(nws_temp - floor, cap - nws_temp)
+        elif market_type == "high":
             buffer = nws_temp - threshold if side == "yes" else threshold - nws_temp
         else:
             buffer = threshold - nws_temp if side == "yes" else nws_temp - threshold
+
         if buffer >= 5.0:
             return 1.0
         if buffer >= 3.0:
@@ -555,16 +634,37 @@ class EdgeEngine:
             return 0.80
         return 1.00
 
+    def _min_liquidity_for_market(self, market: KalshiMarket) -> float:
+        """Return minimum ask depth; expansion cities use a lower threshold."""
+        series = str(market.series_ticker or market.ticker).upper()
+        for expansion in self._expansion_series:
+            if expansion in series:
+                return self.min_liquidity_new_city
+        return self.min_liquidity
+
     def _check_liquidity(self, market: KalshiMarket, side: str | None = None) -> bool:
-        """Only trade markets with meaningful liquidity on the proposed side."""
-        yes_size = float(market.raw.get("yes_ask_size_fp", 0) or 0)
-        no_size = float(market.raw.get("no_ask_size_fp", 0) or 0)
-        min_size = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "20"))
+        """Only trade markets with meaningful liquidity on the proposed side.
+
+        Kalshi often omits no_ask_size_fp even when a NO ask price exists — if the
+        ask price is present and tradeable, do not block on missing size data.
+        """
+        yes_size = float(market.raw.get("yes_ask_size_fp") or 0)
+        no_size = float(market.raw.get("no_ask_size_fp") or 0)
+        min_size = self._min_liquidity_for_market(market)
         if side == "yes":
+            if yes_size <= 0 and market.yes_ask is not None and market.yes_ask >= 0.05:
+                return True
             return yes_size >= min_size
         if side == "no":
+            if no_size <= 0 and market.no_ask is not None and market.no_ask >= 0.05:
+                return True
             return no_size >= min_size
-        return yes_size >= min_size or no_size >= min_size
+        if yes_size >= min_size or no_size >= min_size:
+            return True
+        return (
+            (market.yes_ask is not None and market.yes_ask >= 0.05)
+            or (market.no_ask is not None and market.no_ask >= 0.05)
+        )
 
     def _calculate_ev(
         self,
@@ -626,10 +726,23 @@ class EdgeEngine:
         """Use the side's probability as confidence (larger buffer -> further from 0.5)."""
         return nws_probability_yes if side == "yes" else 1 - nws_probability_yes
 
-    def _nws_agrees(self, temperature_f: float | None, threshold: float, market_type: str, side: str) -> bool:
+    def _nws_agrees(
+        self,
+        temperature_f: float | None,
+        threshold: float,
+        market_type: str,
+        side: str,
+        *,
+        strike_type: str = "greater",
+        floor_strike: float | None = None,
+        cap_strike: float | None = None,
+    ) -> bool:
         """Return True when NWS points in the same YES/NO direction."""
         if temperature_f is None:
             return False
+        if strike_type == "between" and floor_strike is not None and cap_strike is not None:
+            inside = floor_strike <= temperature_f <= cap_strike
+            return inside if side == "yes" else not inside
         nws_yes = temperature_f > threshold if market_type == "high" else temperature_f < threshold
         return nws_yes if side == "yes" else not nws_yes
 
