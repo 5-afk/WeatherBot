@@ -274,6 +274,31 @@ class KalshiClient:
             return None
         return self._normalize_market(raw)
 
+    def get_market_rules(self, ticker: str, *, settlement_station: str = "") -> dict[str, Any]:
+        """Fetch official contract rules and settlement metadata for Claude review."""
+        try:
+            data = self._request("GET", f"/markets/{ticker}", auth_required=False)
+        except Exception as exc:
+            logging.warning("Market rules fetch failed for %s: %s", ticker, exc)
+            return {
+                "rules_primary": "",
+                "rules_secondary": "",
+                "expiration_time": "",
+                "close_time": "",
+                "settlement_station": settlement_station,
+            }
+        market = data.get("market", data)
+        return {
+            "rules_primary": str(market.get("rules_primary", "")),
+            "rules_secondary": str(market.get("rules_secondary", "")),
+            "expiration_time": market.get("expiration_time") or market.get("expected_expiration_time") or "",
+            "close_time": market.get("close_time") or "",
+            "settlement_station": settlement_station,
+            "strike_type": market.get("strike_type"),
+            "floor_strike": market.get("floor_strike"),
+            "cap_strike": market.get("cap_strike"),
+        }
+
     def get_positions(self) -> list[dict[str, Any]]:
         """Fetch the account's non-zero market positions.
 
@@ -294,19 +319,57 @@ class KalshiClient:
             return []
 
     def get_balance(self) -> float | None:
-        """Fetch real account balance with retry on connection errors."""
+        """Fetch available cash balance (excludes open position mark-to-market)."""
+        portfolio = self.get_portfolio_balance()
+        return portfolio.get("cash") if portfolio else None
+
+    def get_portfolio_balance(self) -> dict[str, float] | None:
+        """Return cash, open-position value, and total portfolio value from Kalshi.
+
+        GET /portfolio/balance returns:
+        - balance_dollars: cash available for trading
+        - portfolio_value: current value of all open positions (cents)
+        Total equity = cash + positions_value.
+        """
         import time
         for attempt in range(3):
             try:
                 data = self._request("GET", "/portfolio/balance", auth_required=True)
-                balance = data.get("balance_dollars") or data.get("balance")
-                if balance is not None:
-                    return round(float(balance), 2)
-                return None
+                cash = self._parse_balance_dollars(
+                    data.get("balance_dollars"),
+                    data.get("balance"),
+                )
+                positions_value = self._parse_balance_dollars(
+                    data.get("portfolio_value_dollars"),
+                    data.get("portfolio_value"),
+                )
+                if cash is None:
+                    return None
+                positions_value = positions_value or 0.0
+                return {
+                    "cash": round(cash, 2),
+                    "positions_value": round(positions_value, 2),
+                    "total": round(cash + positions_value, 2),
+                }
             except Exception as exc:
-                logging.warning("Balance fetch attempt %d/3 failed: %s", attempt + 1, exc)
+                logging.warning("Portfolio balance fetch attempt %d/3 failed: %s", attempt + 1, exc)
                 if attempt < 2:
                     time.sleep(5)
+        return None
+
+    @staticmethod
+    def _parse_balance_dollars(dollars: Any, cents: Any) -> float | None:
+        """Parse Kalshi dollar-string or integer-cents balance fields."""
+        if dollars is not None:
+            try:
+                return float(dollars)
+            except (TypeError, ValueError):
+                pass
+        if cents is not None:
+            try:
+                return float(cents) / 100.0
+            except (TypeError, ValueError):
+                pass
         return None
 
     @property

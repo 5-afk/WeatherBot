@@ -1,9 +1,10 @@
-"""Weather API client for NWS gridded forecasts and station observations."""
+"""Weather API client for NWS station-specific forecasts and observations."""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -11,6 +12,41 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
+
+
+# Station mappings — must match the exact NWS station each Kalshi market settles on.
+KALSHI_SETTLEMENT_STATIONS: dict[str, str] = {
+    "New York": "KNYC",       # Central Park
+    "Chicago": "KMDW",        # Midway Airport
+    "Miami": "KMIA",          # Miami International Airport
+    "Los Angeles": "KLAX",    # Los Angeles International Airport
+    "Denver": "KDEN",         # Denver International Airport
+    "Seattle": "KSEA",       # Seattle-Tacoma International Airport
+    "San Francisco": "KSFO",  # San Francisco International Airport
+    "Dallas": "KDFW",         # Dallas/Fort Worth International Airport
+    "Minneapolis": "KMSP",    # Minneapolis-St Paul International Airport
+    "Oklahoma City": "KOKC",  # Will Rogers World Airport
+    "Atlanta": "KATL",        # Hartsfield-Jackson Atlanta International Airport
+    "Boston": "KBOS",        # Boston Logan International Airport
+    "Washington DC": "KDCA",  # Reagan National Airport
+}
+
+# Substrings expected in Kalshi rules_primary for each settlement station.
+_SETTLEMENT_RULE_HINTS: dict[str, list[str]] = {
+    "New York": ["Central Park", "KNYC", "New York City"],
+    "Chicago": ["Midway", "KMDW", "Chicago"],
+    "Miami": ["Miami", "KMIA"],
+    "Los Angeles": ["Los Angeles Airport", "KLAX", "Los Angeles International"],
+    "Denver": ["Denver", "KDEN"],
+    "Seattle": ["Seattle", "KSEA", "Sea-Tac"],
+    "San Francisco": ["San Francisco", "KSFO"],
+    "Dallas": ["Dallas", "KDFW", "Fort Worth", "DFW"],
+    "Minneapolis": ["Minneapolis", "KMSP"],
+    "Oklahoma City": ["Oklahoma City", "KOKC"],
+    "Atlanta": ["Atlanta", "KATL"],
+    "Boston": ["Boston", "KBOS", "Logan"],
+    "Washington DC": ["Reagan", "KDCA", "Washington", "National Airport"],
+}
 
 
 @dataclass(frozen=True)
@@ -46,35 +82,46 @@ class CityConfig:
         """Return a short city code for compact logs."""
         return self.ticker.replace("KXHIGH", "")
 
+    @property
+    def settlement_station(self) -> str:
+        """Return the ICAO station ID Kalshi uses to settle this city's markets."""
+        return KALSHI_SETTLEMENT_STATIONS.get(self.name, self.nws_station)
+
 
 @dataclass(frozen=True)
 class NwsForecast:
-    """NWS gridded hourly forecast matched to the market settlement date."""
+    """NWS station hourly forecast matched to the market settlement date."""
 
     temperature_f: float | None
     short_forecast: str
     source: str
 
 
+def _city(name: str, ticker: str, lat: float, lon: float, tz: str, **kwargs: float) -> CityConfig:
+    """Build a CityConfig with the canonical settlement station for the city."""
+    station = KALSHI_SETTLEMENT_STATIONS[name]
+    return CityConfig(name, ticker, lat, lon, station, tz, **kwargs)
+
+
 # Original 5 cities — kept first so CITY_COUNT=5 selects exactly these.
 ORIGINAL_CITIES: dict[str, CityConfig] = {
-    "New York": CityConfig("New York", "KXHIGHNY", 40.7128, -74.0060, "KNYC", "America/New_York", nws_bias_f=-1.5),
-    "Chicago": CityConfig("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "KMDW", "America/Chicago", nws_bias_f=-1.5),
-    "Miami": CityConfig("Miami", "KXHIGHMIA", 25.7617, -80.1918, "KMIA", "America/New_York", nws_bias_f=-1.5),
-    "Los Angeles": CityConfig("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "KLAX", "America/Los_Angeles", nws_bias_f=-1.5),
-    "Denver": CityConfig("Denver", "KXHIGHDEN", 39.7392, -104.9903, "KDEN", "America/Denver", nws_bias_f=-1.5),
+    "New York": _city("New York", "KXHIGHNY", 40.7128, -74.0060, "America/New_York", nws_bias_f=-1.5),
+    "Chicago": _city("Chicago", "KXHIGHCHI", 41.8781, -87.6298, "America/Chicago", nws_bias_f=-1.5),
+    "Miami": _city("Miami", "KXHIGHMIA", 25.7617, -80.1918, "America/New_York", nws_bias_f=-1.5),
+    "Los Angeles": _city("Los Angeles", "KXHIGHLAX", 34.0522, -118.2437, "America/Los_Angeles", nws_bias_f=-1.5),
+    "Denver": _city("Denver", "KXHIGHDEN", 39.7392, -104.9903, "America/Denver", nws_bias_f=-1.5),
 }
 
 # 8 expansion cities — enabled when CITY_COUNT >= 13.
 EXTENDED_CITIES: dict[str, CityConfig] = {
-    "Seattle": CityConfig("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "KSEA", "America/Los_Angeles", nws_bias_f=-1.0),
-    "San Francisco": CityConfig("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "KSFO", "America/Los_Angeles", nws_bias_f=-1.0),
-    "Dallas": CityConfig("Dallas", "KXHIGHTDAL", 32.7767, -96.7970, "KDAL", "America/Chicago", nws_bias_f=-1.5),
-    "Minneapolis": CityConfig("Minneapolis", "KXHIGHTMIN", 44.9778, -93.2650, "KMSP", "America/Chicago", nws_bias_f=-1.5),
-    "Oklahoma City": CityConfig("Oklahoma City", "KXHIGHTOKC", 35.4676, -97.5164, "KOKC", "America/Chicago", nws_bias_f=-1.5),
-    "Atlanta": CityConfig("Atlanta", "KXHIGHTATL", 33.7490, -84.3880, "KATL", "America/New_York", nws_bias_f=-1.5),
-    "Boston": CityConfig("Boston", "KXHIGHTBOS", 42.3601, -71.0589, "KBOS", "America/New_York", nws_bias_f=-1.5),
-    "Washington DC": CityConfig("Washington DC", "KXHIGHTDC", 38.9072, -77.0369, "KDCA", "America/New_York", nws_bias_f=-1.5),
+    "Seattle": _city("Seattle", "KXHIGHTSEA", 47.6062, -122.3321, "America/Los_Angeles", nws_bias_f=-1.0),
+    "San Francisco": _city("San Francisco", "KXHIGHTSFO", 37.7749, -122.4194, "America/Los_Angeles", nws_bias_f=-1.0),
+    "Dallas": _city("Dallas", "KXHIGHTDAL", 32.7767, -96.7970, "America/Chicago", nws_bias_f=-1.5),
+    "Minneapolis": _city("Minneapolis", "KXHIGHTMIN", 44.9778, -93.2650, "America/Chicago", nws_bias_f=-1.5),
+    "Oklahoma City": _city("Oklahoma City", "KXHIGHTOKC", 35.4676, -97.5164, "America/Chicago", nws_bias_f=-1.5),
+    "Atlanta": _city("Atlanta", "KXHIGHTATL", 33.7490, -84.3880, "America/New_York", nws_bias_f=-1.5),
+    "Boston": _city("Boston", "KXHIGHTBOS", 42.3601, -71.0589, "America/New_York", nws_bias_f=-1.5),
+    "Washington DC": _city("Washington DC", "KXHIGHTDC", 38.9072, -77.0369, "America/New_York", nws_bias_f=-1.5),
 }
 
 CITIES: dict[str, CityConfig] = {**ORIGINAL_CITIES, **EXTENDED_CITIES}
@@ -84,6 +131,7 @@ class WeatherClient:
     """Fetch and normalize weather data from free NWS public APIs."""
 
     NWS_BASE_URL = "https://api.weather.gov"
+    _ICAO_RE = re.compile(r"\bK[A-Z]{3}\b")
 
     def __init__(self) -> None:
         """Create an HTTP session and read API-related settings from env vars."""
@@ -92,20 +140,18 @@ class WeatherClient:
         self.nws_user_agent = os.getenv("NWS_USER_AGENT", "kalshi-weather-bot/1.0")
         self.nws_warm_bias_f = float(os.getenv("NWS_SUMMER_HIGH_WARM_BIAS_F", "1.5"))
         self.nws_low_bias_f = float(os.getenv("NWS_SUMMER_LOW_BIAS_F", "1.0"))
-        # Per-city gridpoint coordinates (office, gridX, gridY) — never change.
-        self._gridpoint_cache: dict[str, tuple[str, int, int]] = {}
-        # Hourly forecast bundle per (city, date): {"high": NwsForecast, "low": NwsForecast}
+        # Station lat/lon and gridpoint — permanent caches (coordinates never change).
+        self._station_coords_cache: dict[str, tuple[float, float]] = {}
+        self._station_gridpoint_cache: dict[str, tuple[str, int, int]] = {}
+        # Hourly forecast bundle per (station_id, date): {"high": NwsForecast, "low": NwsForecast}
         self._forecast_cache: dict[tuple[str, str], tuple[dict[str, NwsForecast], datetime]] = {}
         cache_ttl_minutes = int(os.getenv("NWS_FORECAST_CACHE_TTL_MINUTES", "60"))
         self._cache_ttl = timedelta(minutes=cache_ttl_minutes)
         self._cache_lock = threading.Lock()
+        self._nws_headers = {"User-Agent": self.nws_user_agent, "Accept": "application/geo+json"}
 
     def watched_cities(self) -> list[CityConfig]:
-        """Return the city list to scan, controlled by the CITY_COUNT env flag.
-
-        CITY_COUNT=13 (default) scans all cities. Set CITY_COUNT=5 to scan only
-        the original five cities.
-        """
+        """Return the city list to scan, controlled by the CITY_COUNT env flag."""
         city_count = int(os.getenv("CITY_COUNT", "13"))
         if city_count >= len(CITIES):
             return list(CITIES.values())
@@ -126,20 +172,21 @@ class WeatherClient:
                 return city
         return None
 
-    def get_nws_gridded_forecast(
+    def get_station_forecast(
         self,
         city: CityConfig,
         target_date: date,
         market_type: str,
     ) -> NwsForecast:
-        """Return NWS gridded hourly forecast high/low for the target date.
+        """Return NWS hourly forecast high/low for the city's settlement station.
 
-        One hourly API call per (city, date) yields both HIGH and LOW forecasts.
-        HIGH = max temp 12:00-18:00 local; LOW = min temp 00:00-08:00 local.
-        Summer bias correction is applied before caching.
+        Resolves the gridpoint from the station's own coordinates (not the city's
+        general area lat/lon), then extracts peak heating / overnight low windows
+        in the city's local timezone.
         """
-        want = "high" if market_type == "high" else "low"
-        cache_key = (city.name, str(target_date))
+        station_id = city.settlement_station
+        want = "high" if market_type.lower() == "high" else "low"
+        cache_key = (station_id, str(target_date))
         with self._cache_lock:
             cached = self._forecast_cache.get(cache_key)
             if cached is not None:
@@ -147,45 +194,208 @@ class WeatherClient:
                 if datetime.now() < expires_at:
                     return bundle[want]
 
-        bundle = self._fetch_gridded_bundle(city, target_date)
+        bundle = self._fetch_station_bundle(station_id, city, target_date)
         with self._cache_lock:
             self._forecast_cache[cache_key] = (bundle, datetime.now() + self._cache_ttl)
         return bundle[want]
 
-    def _fetch_gridded_bundle(self, city: CityConfig, target_date: date) -> dict[str, NwsForecast]:
-        """Fetch hourly forecast and build HIGH/LOW NwsForecast bundle."""
-        empty_high = NwsForecast(None, "NWS gridded fetch failed", city.nws_station)
-        empty_low = NwsForecast(None, "NWS gridded fetch failed", city.nws_station)
-        headers = {"User-Agent": self.nws_user_agent, "Accept": "application/geo+json"}
+    def get_station_forecast_temp(
+        self,
+        station_id: str,
+        target_date: date,
+        market_type: str,
+        tz: str,
+    ) -> float | None:
+        """Return raw forecast temperature (°F) for a specific station without bias."""
+        headers = self._nws_headers
         try:
-            office, grid_x, grid_y = self._resolve_gridpoint(city, headers)
+            office, grid_x, grid_y = self._resolve_station_gridpoint(station_id, headers)
             url = f"{self.NWS_BASE_URL}/gridpoints/{office}/{grid_x},{grid_y}/forecast/hourly"
             response = self.session.get(url, headers=headers, timeout=self.timeout_seconds)
             response.raise_for_status()
             periods = response.json().get("properties", {}).get("periods", [])
-            return self._build_bundle_from_periods(city, target_date, periods)
+            return self._extract_temp_from_periods(periods, target_date, market_type, tz)
         except Exception as exc:
-            logging.warning("NWS gridded forecast failed for %s: %s", city.name, exc)
-            return {"high": empty_high, "low": empty_low}
+            logging.warning("Station forecast temp failed for %s: %s", station_id, exc)
+            return None
 
-    def _resolve_gridpoint(self, city: CityConfig, headers: dict[str, str]) -> tuple[str, int, int]:
-        """Return (office, gridX, gridY) for a city, caching forever after first lookup."""
+    def verify_settlement_stations(self, kalshi_client: Any) -> None:
+        """One-time startup check: confirm our station map matches Kalshi rules_primary."""
+        logging.info("Verifying settlement station mappings against Kalshi market rules...")
+        for city in self.watched_cities():
+            station = city.settlement_station
+            try:
+                payload = kalshi_client._request(
+                    "GET",
+                    "/markets",
+                    params={"series_ticker": city.high_series, "status": "open", "limit": 1},
+                    auth_required=False,
+                )
+                markets = payload.get("markets", [])
+                if not markets:
+                    logging.warning("Settlement verify: no open market for %s (%s)", city.name, city.high_series)
+                    continue
+                rules = str(markets[0].get("rules_primary", ""))
+                hints = _SETTLEMENT_RULE_HINTS.get(city.name, [station])
+                matched = any(hint.lower() in rules.lower() for hint in hints)
+                icao_in_rules = self._ICAO_RE.findall(rules.upper())
+                if icao_in_rules and station not in icao_in_rules:
+                    logging.critical(
+                        "SETTLEMENT STATION MISMATCH %s: configured %s but rules_primary mentions %s | rules=%s",
+                        city.name,
+                        station,
+                        icao_in_rules,
+                        rules[:200],
+                    )
+                elif not matched:
+                    logging.critical(
+                        "SETTLEMENT STATION UNVERIFIED %s: expected hints %s not found in rules_primary | rules=%s",
+                        city.name,
+                        hints,
+                        rules[:200],
+                    )
+                else:
+                    logging.info("Settlement station verified: %s -> %s", city.name, station)
+            except Exception as exc:
+                logging.warning("Settlement verify failed for %s: %s", city.name, exc)
+
+    def log_forecast_vs_observation(self, city: CityConfig, target_date: date | None = None) -> None:
+        """Log station forecast vs latest METAR for diagnostics (e.g. KLAX sanity check)."""
+        station_id = city.settlement_station
+        target_date = target_date or datetime.now(ZoneInfo(city.tz)).date()
+        forecast_high = self.get_station_forecast_temp(station_id, target_date, "high", city.tz)
+        forecast_low = self.get_station_forecast_temp(station_id, target_date, "low", city.tz)
+
+        obs = self.latest_station_observation(city)
+        obs_temp_c: float | None = None
+        if obs:
+            obs_temp_c = self._safe_float((obs.get("properties") or {}).get("temperature", {}).get("value"))
+        obs_temp_f = round(obs_temp_c * 9 / 5 + 32, 1) if obs_temp_c is not None else None
+
+        # Also fetch area-grid forecast at city lat/lon for discrepancy visibility.
+        area_high = self._area_grid_forecast_temp(city, target_date, "high")
+
+        logging.info(
+            "[FORECAST CHECK] %s (%s) date=%s | station HIGH=%s°F LOW=%s°F | "
+            "METAR now=%s°F | area-grid HIGH=%s°F (city lat/lon, not settlement station)",
+            city.name,
+            station_id,
+            target_date,
+            forecast_high,
+            forecast_low,
+            obs_temp_f,
+            area_high,
+        )
+        if forecast_high is not None and obs_temp_f is not None:
+            delta = abs(forecast_high - obs_temp_f)
+            if delta > 8:
+                logging.warning(
+                    "[FORECAST CHECK] %s station HIGH %.1f°F vs METAR now %.1f°F — "
+                    "delta %.1f°F (expected within ~2-3°F only when peak has already occurred)",
+                    city.name,
+                    forecast_high,
+                    obs_temp_f,
+                    delta,
+                )
+
+    def _fetch_station_bundle(
+        self,
+        station_id: str,
+        city: CityConfig,
+        target_date: date,
+    ) -> dict[str, NwsForecast]:
+        """Fetch hourly forecast at the station gridpoint and build HIGH/LOW bundle."""
+        empty = NwsForecast(None, "NWS station forecast fetch failed", station_id)
+        try:
+            office, grid_x, grid_y = self._resolve_station_gridpoint(station_id, self._nws_headers)
+            url = f"{self.NWS_BASE_URL}/gridpoints/{office}/{grid_x},{grid_y}/forecast/hourly"
+            response = self.session.get(url, headers=self._nws_headers, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            periods = response.json().get("properties", {}).get("periods", [])
+            return self._build_bundle_from_periods(station_id, city, target_date, periods)
+        except Exception as exc:
+            logging.warning("NWS station forecast failed for %s (%s): %s", city.name, station_id, exc)
+            return {"high": empty, "low": empty}
+
+    def _resolve_station_gridpoint(
+        self,
+        station_id: str,
+        headers: dict[str, str],
+    ) -> tuple[str, int, int]:
+        """Return (office, gridX, gridY) for a station, caching forever after first lookup."""
         with self._cache_lock:
-            cached = self._gridpoint_cache.get(city.name)
+            cached = self._station_gridpoint_cache.get(station_id)
             if cached is not None:
                 return cached
 
-        point_url = f"{self.NWS_BASE_URL}/points/{city.lat:.4f},{city.lon:.4f}"
+        lat, lon = self._resolve_station_coords(station_id, headers)
+        point_url = f"{self.NWS_BASE_URL}/points/{lat},{lon}"
         response = self.session.get(point_url, headers=headers, timeout=self.timeout_seconds)
         response.raise_for_status()
         props = response.json()["properties"]
         gridpoint = (str(props["gridId"]), int(props["gridX"]), int(props["gridY"]))
         with self._cache_lock:
-            self._gridpoint_cache[city.name] = gridpoint
+            self._station_gridpoint_cache[station_id] = gridpoint
         return gridpoint
+
+    def _resolve_station_coords(self, station_id: str, headers: dict[str, str]) -> tuple[float, float]:
+        """Return (lat, lon) for an NWS station, caching permanently."""
+        with self._cache_lock:
+            cached = self._station_coords_cache.get(station_id)
+            if cached is not None:
+                return cached
+
+        station_url = f"{self.NWS_BASE_URL}/stations/{station_id}"
+        response = self.session.get(station_url, headers=headers, timeout=self.timeout_seconds)
+        response.raise_for_status()
+        coords = response.json()["geometry"]["coordinates"]
+        lon, lat = float(coords[0]), float(coords[1])
+        with self._cache_lock:
+            self._station_coords_cache[station_id] = (lat, lon)
+        return lat, lon
+
+    def _extract_temp_from_periods(
+        self,
+        periods: list[dict[str, Any]],
+        target_date: date,
+        market_type: str,
+        tz_name: str,
+    ) -> float | None:
+        """Extract HIGH (max 12-20 local) or LOW (min 0-8 local) from hourly periods."""
+        tz = ZoneInfo(tz_name)
+        want_high = market_type.upper() == "HIGH"
+        temps: list[float] = []
+        all_day: list[float] = []
+
+        for period in periods:
+            start_time = period.get("startTime")
+            if not start_time:
+                continue
+            try:
+                local_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00")).astimezone(tz)
+            except ValueError:
+                continue
+            if local_dt.date() != target_date:
+                continue
+            temp = self._safe_float(period.get("temperature"))
+            if temp is None:
+                continue
+            all_day.append(temp)
+            hour = local_dt.hour
+            if want_high and 12 <= hour <= 20:
+                temps.append(temp)
+            elif not want_high and 0 <= hour <= 8:
+                temps.append(temp)
+
+        if temps:
+            return max(temps) if want_high else min(temps)
+        if all_day:
+            return max(all_day) if want_high else min(all_day)
+        return None
 
     def _build_bundle_from_periods(
         self,
+        station_id: str,
         city: CityConfig,
         target_date: date,
         periods: list[dict[str, Any]],
@@ -214,7 +424,7 @@ class WeatherClient:
             all_day_temps.append(temp)
             hour = local_dt.hour
             short = str(period.get("shortForecast", ""))
-            if 12 <= hour <= 18:
+            if 12 <= hour <= 20:
                 high_temps.append(temp)
                 if not high_short:
                     high_short = short
@@ -232,15 +442,32 @@ class WeatherClient:
         return {
             "high": NwsForecast(
                 high_temp,
-                high_short or "NWS gridded hourly",
-                f"{city.nws_station} via NWS gridded hourly",
+                high_short or "NWS station hourly",
+                f"{station_id} via NWS station hourly",
             ),
             "low": NwsForecast(
                 low_temp,
-                low_short or "NWS gridded hourly",
-                f"{city.nws_station} via NWS gridded hourly",
+                low_short or "NWS station hourly",
+                f"{station_id} via NWS station hourly",
             ),
         }
+
+    def _area_grid_forecast_temp(self, city: CityConfig, target_date: date, market_type: str) -> float | None:
+        """Legacy area-grid forecast at city lat/lon — for discrepancy logging only."""
+        headers = self._nws_headers
+        try:
+            point_url = f"{self.NWS_BASE_URL}/points/{city.lat:.4f},{city.lon:.4f}"
+            response = self.session.get(point_url, headers=headers, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            props = response.json()["properties"]
+            office, grid_x, grid_y = str(props["gridId"]), int(props["gridX"]), int(props["gridY"])
+            url = f"{self.NWS_BASE_URL}/gridpoints/{office}/{grid_x},{grid_y}/forecast/hourly"
+            response = self.session.get(url, headers=headers, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            periods = response.json().get("properties", {}).get("periods", [])
+            return self._extract_temp_from_periods(periods, target_date, market_type, city.tz)
+        except Exception:
+            return None
 
     def _apply_bias(
         self,
@@ -260,14 +487,14 @@ class WeatherClient:
 
     def latest_station_observation(self, city: CityConfig) -> dict[str, Any] | None:
         """Fetch the latest station observation for debugging and audit logs."""
-        headers = {"User-Agent": self.nws_user_agent, "Accept": "application/geo+json"}
-        url = f"{self.NWS_BASE_URL}/stations/{city.nws_station}/observations/latest"
+        station_id = city.settlement_station
+        url = f"{self.NWS_BASE_URL}/stations/{station_id}/observations/latest"
         try:
-            response = self.session.get(url, headers=headers, timeout=self.timeout_seconds)
+            response = self.session.get(url, headers=self._nws_headers, timeout=self.timeout_seconds)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as exc:
-            logging.warning("NWS station observation failed for %s: %s", city.nws_station, exc)
+            logging.warning("NWS station observation failed for %s: %s", station_id, exc)
             return None
 
     @staticmethod

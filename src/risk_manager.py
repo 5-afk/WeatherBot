@@ -7,6 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,68 @@ class RiskManager:
             }
             for r in rows
         ]
+
+    def sync_from_kalshi(self, kalshi: Any) -> dict[str, Any]:
+        """Reconcile SQLite open positions and running_budget with live Kalshi state.
+
+        - running_budget is set to real cash balance (not stale compounded value)
+        - Any open live position absent from Kalshi's position list is closed
+          with realized P&L derived from the settled market result (win or loss)
+        """
+        portfolio = kalshi.get_portfolio_balance()
+        if portfolio is None:
+            raise RuntimeError("Could not fetch Kalshi portfolio balance")
+
+        cash = float(portfolio["cash"])
+        live_tickers: set[str] = set()
+        for pos in kalshi.get_positions():
+            try:
+                signed = int(float(pos.get("position_fp") or 0))
+            except (TypeError, ValueError):
+                signed = 0
+            ticker = str(pos.get("ticker", ""))
+            if signed != 0 and ticker:
+                live_tickers.add(ticker)
+
+        closed_lines: list[str] = []
+        for pos in self.open_positions_detail():
+            ticker = pos["ticker"]
+            if ticker in live_tickers:
+                continue
+            realized = self.resolve_settled_pnl(kalshi, pos)
+            self.record_resolution(ticker, realized)
+            if realized >= 0:
+                closed_lines.append(f"{ticker} (+${realized:.2f})")
+            else:
+                closed_lines.append(f"{ticker} (-${abs(realized):.2f})")
+
+        self._set_state("running_budget", str(round(cash, 2)))
+
+        return {
+            "cash": round(cash, 2),
+            "positions_value": float(portfolio["positions_value"]),
+            "total": float(portfolio["total"]),
+            "running_budget": round(cash, 2),
+            "closed": closed_lines,
+            "live_position_count": len(live_tickers),
+        }
+
+    @staticmethod
+    def resolve_settled_pnl(kalshi: Any, pos: dict[str, Any]) -> float:
+        """Compute realized P&L for a position no longer held on Kalshi."""
+        stake = float(pos["stake"])
+        side = str(pos["side"]).lower()
+        contracts = int(pos["contracts"])
+        market = kalshi.get_market(pos["ticker"])
+        if market is not None:
+            status = str(market.raw.get("status", "")).lower()
+            result = str(market.raw.get("result", "")).lower()
+            if status in {"settled", "finalized", "closed"} and result in {"yes", "no"}:
+                won = side == result
+                if won:
+                    return round(contracts * 1.0 - stake, 2)
+                return round(-stake, 2)
+        return round(-stake, 2)
 
     def open_position_count(self) -> int:
         """Count live open positions, excluding dry-run rows.

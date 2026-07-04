@@ -96,14 +96,35 @@ class Trader:
         self._claude_calls_today = 0
         self._claude_call_date = datetime.now(timezone.utc).date()
         self._scan_lock = threading.Lock()
-        # Always sync real balance from Kalshi on startup
-        real_balance = self.kalshi.get_balance()
-        if real_balance and real_balance > 0:
-            self.risk._set_state("running_budget", str(real_balance))
-            logging.info("Kalshi balance synced: $%.2f", real_balance)
+        if not self.dry_run:
+            try:
+                report = self.risk.sync_from_kalshi(self.kalshi)
+                logging.info(
+                    "[STATE SYNC] cash=$%.2f running_budget=$%.2f closed=%s live_on_kalshi=%d",
+                    report["cash"],
+                    report["running_budget"],
+                    report["closed"] or "none",
+                    report["live_position_count"],
+                )
+            except Exception as exc:
+                logging.warning("Startup Kalshi state sync failed: %s", exc)
+                real_balance = self.kalshi.get_balance()
+                if real_balance is not None:
+                    self.risk._set_state("running_budget", str(real_balance))
+                    logging.info("Kalshi cash balance synced: $%.2f", real_balance)
         else:
-            logging.warning("Could not fetch Kalshi balance — keeping local budget")
+            logging.info("Dry run — skipping Kalshi state sync")
         self._ensure_pnl_file()
+        try:
+            self.weather.verify_settlement_stations(self.kalshi)
+        except Exception as exc:
+            logging.warning("Settlement station verification failed: %s", exc)
+        lax = self.weather.city_for_market("KXHIGHLAX")
+        if lax is not None:
+            try:
+                self.weather.log_forecast_vs_observation(lax)
+            except Exception as exc:
+                logging.warning("KLAX forecast vs observation check failed: %s", exc)
 
     def run_full_pipeline(self) -> None:
         """Run one full scan: collect markets, evaluate math, call Claude once, trade."""
@@ -248,7 +269,8 @@ class Trader:
                     continue
                 if result is not None:
                     results.append(result)
-        results.sort(key=lambda item: item[2].signal_score, reverse=True)
+        # NO preferred when signal scores are equal — more brackets resolve NO than YES.
+        results.sort(key=lambda item: (0 if item[2].side == "no" else 1, -item[2].signal_score))
         return results
 
     def _math_evaluate(
@@ -270,7 +292,7 @@ class Trader:
             with self._scan_lock:
                 cached_weather = self._weather_cache.get(cache_key)
             if cached_weather is None:
-                nws = self.weather.get_nws_gridded_forecast(city, target_date, market_type)
+                nws = self.weather.get_station_forecast(city, target_date, market_type)
                 with self._scan_lock:
                     if cache_key not in self._weather_cache:
                         self._weather_cache[cache_key] = nws
@@ -372,6 +394,10 @@ class Trader:
     ) -> dict[str, Any]:
         """Build one candidate row for the single Claude batch call."""
         settlement = market.settlement_time or market.close_time
+        market_rules = self.kalshi.get_market_rules(
+            market.ticker,
+            settlement_station=city.settlement_station,
+        )
         return {
             "ticker": market.ticker,
             "city": city.name,
@@ -390,6 +416,10 @@ class Trader:
             "nws_forecast_f": edge.nws_forecast_temperature_f,
             "hours_until_settlement": edge.hours_until_settlement,
             "settlement": settlement.isoformat() if settlement else None,
+            "rules_primary": market_rules.get("rules_primary", ""),
+            "expiration_time": market_rules.get("expiration_time", ""),
+            "settlement_station": market_rules.get("settlement_station", ""),
+            "last_trading_time": market_rules.get("close_time", ""),
         }
 
     def _select_candidate(
@@ -804,12 +834,15 @@ class Trader:
         )
 
     def check_settlements(self) -> None:
-        """Resolve any open live positions whose market has settled.
+        """Resolve open live positions that have settled or vanished from Kalshi.
 
-        Runs at most once per hour. For each open (non-dry-run) position, fetch
-        the market; if it has settled, record the win/loss in SQLite and send a
-        Discord alert with the realized P&L and new balance.
+        A position that no longer appears in GET /portfolio/positions has been
+        fully closed or settled — including losses where value went to $0.
+        Runs at most once per hour during live trading.
         """
+        if self.dry_run:
+            return
+
         now = datetime.now(timezone.utc)
         last = getattr(self, "_last_settlement_check", None)
         if last is not None and (now - last).total_seconds() < 3600:
@@ -822,40 +855,50 @@ class Trader:
             logging.warning("Settlement check could not read positions: %s", exc)
             return
 
+        if not open_positions:
+            return
+
+        live_tickers: set[str] = set()
+        for kalshi_pos in self.kalshi.get_positions():
+            try:
+                signed = int(float(kalshi_pos.get("position_fp") or 0))
+            except (TypeError, ValueError):
+                signed = 0
+            ticker = str(kalshi_pos.get("ticker", ""))
+            if signed != 0 and ticker:
+                live_tickers.add(ticker)
+
+        any_closed = False
         for pos in open_positions:
             ticker = pos["ticker"]
-            try:
-                market = self.kalshi.get_market(ticker)
-            except Exception as exc:
-                logging.warning("Settlement check market fetch failed for %s: %s", ticker, exc)
-                continue
-            if market is None:
-                continue
-            status = str(market.raw.get("status", "")).lower()
-            result = str(market.raw.get("result", "")).lower()
-            if status not in {"settled", "finalized"} or result not in {"yes", "no"}:
+            if ticker in live_tickers:
                 continue
 
+            realized = self.risk.resolve_settled_pnl(self.kalshi, pos)
             side = str(pos["side"]).lower()
             contracts = int(pos["contracts"])
             stake = float(pos["stake"])
-            won = (side == result)
-            if won:
-                payout = contracts * 1.0
-                realized = round(payout - stake, 2)
-            else:
-                payout = 0.0
-                realized = round(-stake, 2)
+
+            market = self.kalshi.get_market(ticker)
+            result = ""
+            if market is not None:
+                result = str(market.raw.get("result", "")).lower()
+            won = (side == result) if result in {"yes", "no"} else realized >= 0
 
             self.risk.record_resolution(ticker, realized)
-            new_balance = self.risk.current_balance()
+            any_closed = True
+
+            portfolio = self.kalshi.get_portfolio_balance()
+            new_balance = portfolio["cash"] if portfolio else self.kalshi.get_balance()
+            balance_str = f"${new_balance:.2f}" if new_balance is not None else "unknown"
             settle_price = 1.00 if won else 0.00
+
             if won:
                 self._send_discord(
                     f"✅ BET WON — {ticker}\n"
                     f"{side.upper()} {contracts} contracts · settled at ${settle_price:.2f}\n"
                     f"Profit: +${realized:.2f}\n"
-                    f"New balance: ${new_balance:.2f}",
+                    f"New balance: {balance_str}",
                     mention=True,
                 )
             else:
@@ -863,10 +906,16 @@ class Trader:
                     f"❌ BET LOST — {ticker}\n"
                     f"{side.upper()} {contracts} contracts · settled at ${settle_price:.2f}\n"
                     f"Loss: -${abs(realized):.2f}\n"
-                    f"New balance: ${new_balance:.2f}",
+                    f"New balance: {balance_str}",
                     mention=True,
                 )
-            logging.info("[SETTLED] %s %s result=%s realized=%.2f", ticker, side, result, realized)
+            logging.info("[SETTLED] %s %s result=%s realized=%.2f", ticker, side, result or "gone", realized)
+
+        if any_closed:
+            portfolio = self.kalshi.get_portfolio_balance()
+            if portfolio is not None:
+                self.risk._set_state("running_budget", str(portfolio["cash"]))
+                logging.info("[SETTLED] running_budget synced to cash $%.2f", portfolio["cash"])
 
     def _user_ping(self) -> str:
         """Return a Discord user mention string for notifications."""

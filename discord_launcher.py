@@ -317,6 +317,19 @@ class BotLauncher:
             else:
                 await ctx.send("⚠️ Could not fetch balance")
 
+        @self.bot.command(name="resetstate")
+        async def resetstate_cmd(ctx):
+            """Sync SQLite running_budget and open positions with live Kalshi state."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            await ctx.send("🔄 Syncing state from Kalshi...")
+            try:
+                report = launcher._reset_state_from_kalshi()
+            except Exception as exc:
+                await ctx.send(f"⚠️ State reset failed: {exc}")
+                return
+            await ctx.send(report)
+
         @self.bot.command(name="positions")
         async def positions_cmd(ctx):
             """Show currently open positions fetched live from Kalshi with P&L."""
@@ -414,6 +427,7 @@ class BotLauncher:
                 "!balance — show real Kalshi account balance\n"
                 "!positions — show open positions with live P&L\n"
                 "!syncpositions — sync open Kalshi positions into local DB\n"
+                "!resetstate — sync cash balance and close settled positions\n"
                 "!logs    — show last 30 log lines\n"
                 "!logsfull — upload full log file\n"
                 "!logssince [hours] — upload recent logs\n"
@@ -461,7 +475,7 @@ class BotLauncher:
 
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
-            "status", "balance", "positions", "syncpositions", "logs", "logsfull",
+            "status", "balance", "positions", "syncpositions", "resetstate", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }
         registered = {command.name for command in self.bot.commands}
@@ -587,6 +601,33 @@ class BotLauncher:
         if 18 <= et_hour < 23:
             return "🟠 Evening (every 30 min)"
         return "🔵 Overnight (every 60 min)"
+
+    def _reset_state_from_kalshi(self) -> str:
+        """Reconcile SQLite with live Kalshi cash and positions. Returns Discord text."""
+        from src.risk_manager import RiskManager
+
+        client = KalshiClient()
+        risk = RiskManager(PROJECT_ROOT / "data" / "positions.db")
+        report = risk.sync_from_kalshi(client)
+
+        lines = [
+            "🔄 State Reset Complete",
+            f"Real Kalshi balance: ${report['cash']:.2f}",
+        ]
+        if report["closed"]:
+            for item in report["closed"]:
+                if item.endswith(")") and "(-$" in item:
+                    ticker, rest = item.split(" ", 1)
+                    lines.append(f"Positions closed as lost: {ticker} {rest}")
+                else:
+                    lines.append(f"Positions closed: {item}")
+        else:
+            lines.append("Positions closed: none")
+        lines.append(f"Running budget updated: ${report['running_budget']:.2f}")
+        if report["positions_value"] > 0:
+            lines.append(f"Open position value: ${report['positions_value']:.2f}")
+            lines.append(f"Total portfolio: ${report['total']:.2f}")
+        return "\n".join(lines)
 
     def _open_positions_report(self) -> str:
         """Build a Discord-friendly report of live open positions with P&L."""

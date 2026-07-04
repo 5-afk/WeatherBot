@@ -88,7 +88,8 @@ class EdgeEngine:
         self.min_ev_per_contract = float(os.getenv("MIN_EV_PER_CONTRACT", "0.05"))
         self.denver_min_edge = float(os.getenv("DENVER_MIN_EDGE", "0.15"))
         self.settlement_window_hours = float(os.getenv("SETTLEMENT_WINDOW_HOURS", "36"))
-        logging.info("EdgeEngine MIN_EV_PER_CONTRACT=%.4f", self.min_ev_per_contract)
+        self.no_side_bias = float(os.getenv("NO_SIDE_BIAS", "1.15"))
+        logging.info("EdgeEngine MIN_EV_PER_CONTRACT=%.4f NO_SIDE_BIAS=%.2f", self.min_ev_per_contract, self.no_side_bias)
 
     def evaluate(
         self,
@@ -117,7 +118,7 @@ class EdgeEngine:
 
         nws_temp = nws.temperature_f
         if nws_temp is None:
-            return self._skip("NWS gridded forecast unavailable.", market_type, threshold, hours_until_settlement)
+            return self._skip("NWS station forecast unavailable.", market_type, threshold, hours_until_settlement)
 
         strike_type = self.strike_type(market)
         lower_threshold = threshold
@@ -317,6 +318,10 @@ class EdgeEngine:
             confidence,
             ev,
         )
+        # Statistically more brackets resolve NO than YES on Kalshi temperature markets.
+        if side == "no":
+            signal_score = min(1.0, round(signal_score * self.no_side_bias, 3))
+            ev = round(ev * self.no_side_bias, 4)
         pre_claude_decision = EdgeDecision(
             False,
             side,
@@ -392,7 +397,7 @@ class EdgeEngine:
             model_probability,
             edge,
             confidence,
-            "Strong NWS gridded forecast with favorable buffer.",
+            "Strong NWS station forecast with favorable buffer.",
             market_type,
             threshold,
             nws_probability_yes,

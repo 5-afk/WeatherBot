@@ -204,7 +204,7 @@ def main() -> None:
         target_date = settlement_time.astimezone(timezone.utc).date()
 
         try:
-            nws = weather.get_nws_gridded_forecast(city, target_date, market_type)
+            nws = weather.get_station_forecast(city, target_date, market_type)
         except Exception as exc:
             print(f"\nMarket: {market.ticker}\nCity: {city.name}\nWould bet: NO\nReason: Weather fetch failed: {exc}")
             continue
