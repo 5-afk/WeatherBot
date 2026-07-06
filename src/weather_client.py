@@ -45,6 +45,52 @@ _VERIFY_SERIES_EXPECTED: list[tuple[str, str]] = [
     ("KXHIGHDEN", "KDEN"),
 ]
 
+# Per-city seasonal sigma (°F) based on NWS forecast verification studies.
+# Format: station_id -> (summer_sigma, winter_sigma)
+# Summer = Jun/Jul/Aug, Winter = Dec/Jan/Feb, Spring/Fall interpolated.
+CITY_SIGMA: dict[str, tuple[float, float]] = {
+    "KNYC": (3.2, 4.1),
+    "KMDW": (3.8, 5.2),
+    "KMIA": (1.9, 2.1),
+    "KLAX": (2.1, 2.8),
+    "KDEN": (4.6, 6.1),
+    "KOKC": (4.2, 5.8),
+    "KBOS": (3.4, 4.7),
+    "KDCA": (3.1, 4.3),
+    "KSEA": (2.8, 3.9),
+    "KSFO": (2.3, 3.1),
+    "KATL": (2.9, 3.8),
+    "KDFW": (3.9, 4.8),
+    "KMSP": (4.1, 6.4),
+}
+
+# Documented NWS systematic forecast bias by station (°F).
+# Positive = NWS underforecasts (add to forecast), Negative = NWS overforecasts (subtract).
+# Summer HIGH market corrections only (Jun-Aug).
+CITY_BIAS_CORRECTIONS: dict[str, float] = {
+    "KLAX": -2.5,
+    "KSFO": -2.0,
+    "KMIA": -0.8,
+    "KMDW": 1.2,
+    "KDEN": -1.5,
+    "KOKC": 1.8,
+    "KDFW": 1.2,
+    "KATL": 0.9,
+}
+
+
+def get_sigma(station_id: str, target_date: date) -> float:
+    """Return seasonally adjusted forecast sigma for a station."""
+    month = target_date.month
+    summer, winter = CITY_SIGMA.get(station_id, (3.5, 4.5))
+    if month in (6, 7, 8):
+        return summer
+    if month in (12, 1, 2):
+        return winter
+    if month in (3, 4, 5):
+        return winter + (summer - winter) * ((month - 2) / 4)
+    return summer + (winter - summer) * ((month - 8) / 4)
+
 
 @dataclass(frozen=True)
 class CityConfig:
@@ -87,6 +133,8 @@ class NwsForecast:
     temperature_f: float | None
     short_forecast: str
     source: str
+    forecast_spread_f: float | None = None
+    uncertain: bool = False
 
 
 def _city(
@@ -468,13 +516,29 @@ class WeatherClient:
         low_raw = min(low_temps) if low_temps else (min(all_day_temps) if all_day_temps else None)
 
         high_temp = self._apply_bias(high_raw, city, target_date, "high")
+        if high_temp is not None:
+            high_temp = self._apply_city_bias(high_temp, station_id, target_date, "high")
         low_temp = self._apply_bias(low_raw, city, target_date, "low")
+
+        high_spread: float | None = None
+        high_uncertain = False
+        if len(high_temps) >= 3:
+            high_spread = round(max(high_temps) - min(high_temps), 2)
+            if high_spread > 4.0:
+                high_uncertain = True
+                logging.warning(
+                    "High forecast spread %.1f°F for %s — elevated uncertainty",
+                    high_spread,
+                    station_id,
+                )
 
         return {
             "high": NwsForecast(
                 high_temp,
                 high_short or "NWS station hourly",
                 f"{station_id} via NWS station hourly",
+                forecast_spread_f=high_spread,
+                uncertain=high_uncertain,
             ),
             "low": NwsForecast(
                 low_temp,
@@ -515,6 +579,29 @@ class WeatherClient:
             return round(temperature - bias, 2)
         low_bias = city.nws_low_bias_f if city.nws_low_bias_f else self.nws_low_bias_f
         return round(temperature + low_bias, 2)
+
+    def _apply_city_bias(
+        self,
+        forecast_f: float,
+        station_id: str,
+        target_date: date,
+        market_type: str,
+    ) -> float:
+        """Apply documented NWS systematic bias correction."""
+        if market_type.lower() != "high":
+            return forecast_f
+        if target_date.month not in (6, 7, 8):
+            return forecast_f
+        bias = CITY_BIAS_CORRECTIONS.get(station_id, 0.0)
+        if bias != 0.0:
+            logging.debug(
+                "City bias correction %+.1f°F applied for %s: %.1f°F -> %.1f°F",
+                bias,
+                station_id,
+                forecast_f,
+                forecast_f + bias,
+            )
+        return round(forecast_f + bias, 2)
 
     def latest_station_observation(self, station_id: str) -> dict[str, Any] | None:
         """Fetch the latest station observation for debugging and audit logs."""

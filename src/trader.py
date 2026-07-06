@@ -334,6 +334,8 @@ class Trader:
         edge = self.edge_engine.evaluate(
             market,
             nws=nws,
+            settlement_station=settlement_station,
+            target_date=target_date,
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,

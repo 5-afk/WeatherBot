@@ -7,10 +7,10 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from src.kalshi_client import KalshiMarket
-from src.weather_client import NwsForecast
+from src.weather_client import NwsForecast, get_sigma
 
 
 def _norm_cdf(x: float, mean: float, sigma: float) -> float:
@@ -18,21 +18,44 @@ def _norm_cdf(x: float, mean: float, sigma: float) -> float:
     return 0.5 * (1 + math.erf((x - mean) / (sigma * math.sqrt(2))))
 
 
+def _time_adjusted_sigma(base_sigma: float, hours_until_settlement: float) -> float:
+    """Collapse sigma as settlement approaches — forecast accuracy improves within same-day window."""
+    if hours_until_settlement >= 24:
+        multiplier = 1.0
+    elif hours_until_settlement >= 18:
+        multiplier = 0.85
+    elif hours_until_settlement >= 12:
+        multiplier = 0.70
+    elif hours_until_settlement >= 6:
+        multiplier = 0.50
+    elif hours_until_settlement >= 2:
+        multiplier = 0.30
+    else:
+        multiplier = 0.20
+    return base_sigma * multiplier
+
+
 def estimate_probability(
     forecast_temp_f: float,
     threshold_f: float,
     market_type: str,
+    *,
     strike_type: str = "greater",
     upper_threshold_f: float | None = None,
+    station_id: str,
+    target_date: date,
+    hours_until_settlement: float | None = None,
+    sigma_multiplier: float = 1.0,
 ) -> float:
-    """Estimate YES probability from an NWS forecast using a normal CDF (sigma=3.5°F).
+    """Estimate YES probability from an NWS forecast using per-city seasonal sigma.
 
     For "between" markets (e.g. B-prefix brackets), YES resolves only when the
     temperature lands inside the bracket, so the probability is
-    P(threshold <= temp < upper), NOT P(temp > threshold). This makes far-off
-    brackets correctly show tiny probability and negative EV.
+    P(threshold <= temp < upper), NOT P(temp > threshold).
     """
-    sigma = float(os.getenv("NWS_FORECAST_SIGMA_F", "3.5"))
+    hours = 24.0 if hours_until_settlement is None else hours_until_settlement
+    base_sigma = get_sigma(station_id, target_date)
+    sigma = _time_adjusted_sigma(base_sigma, hours) * sigma_multiplier
     if strike_type == "between":
         upper = upper_threshold_f if upper_threshold_f is not None else threshold_f + 2.0
         p_above_lower = 1 - _norm_cdf(threshold_f, forecast_temp_f, sigma)
@@ -108,6 +131,8 @@ class EdgeEngine:
         market: KalshiMarket,
         *,
         nws: NwsForecast,
+        settlement_station: str,
+        target_date: date,
         current_temp_f: float | None = None,
         ladder_multiplier: float = 1.0,
         imbalance_score: float = 0.5,
@@ -150,17 +175,22 @@ class EdgeEngine:
                 nws_temp,
             )
 
+        sigma_multiplier = 1.4 if nws.uncertain else 1.0
         nws_probability_yes = estimate_probability(
             nws_temp,
             lower_threshold,
             market_type,
-            strike_type,
-            upper_threshold,
+            strike_type=strike_type,
+            upper_threshold_f=upper_threshold,
+            station_id=settlement_station,
+            target_date=target_date,
+            hours_until_settlement=hours_until_settlement,
+            sigma_multiplier=sigma_multiplier,
         )
 
-        yes_decision = self._evaluate_side(
-            market,
-            side="yes",
+        side_kwargs = dict(
+            settlement_station=settlement_station,
+            target_date=target_date,
             nws_probability_yes=nws_probability_yes,
             nws_temp=nws_temp,
             threshold=threshold,
@@ -173,21 +203,8 @@ class EdgeEngine:
             floor_strike=lower_threshold if strike_type == "between" else None,
             cap_strike=upper_threshold if strike_type == "between" else None,
         )
-        no_decision = self._evaluate_side(
-            market,
-            side="no",
-            nws_probability_yes=nws_probability_yes,
-            nws_temp=nws_temp,
-            threshold=threshold,
-            market_type=market_type,
-            hours_until_settlement=hours_until_settlement,
-            current_temp_f=current_temp_f,
-            ladder_multiplier=ladder_multiplier,
-            imbalance_score=imbalance_score,
-            strike_type=strike_type,
-            floor_strike=lower_threshold if strike_type == "between" else None,
-            cap_strike=upper_threshold if strike_type == "between" else None,
-        )
+        yes_decision = self._evaluate_side(market, side="yes", **side_kwargs)
+        no_decision = self._evaluate_side(market, side="no", **side_kwargs)
 
         passing = [d for d in (yes_decision, no_decision) if d.should_trade]
         if passing:
@@ -218,6 +235,8 @@ class EdgeEngine:
         market: KalshiMarket,
         *,
         side: str,
+        settlement_station: str,
+        target_date: date,
         nws_probability_yes: float,
         nws_temp: float,
         threshold: float,
@@ -275,6 +294,15 @@ class EdgeEngine:
                 ladder_multiplier=ladder_multiplier,
             )
 
+        raw_buffer = self._raw_buffer(
+            nws_temp,
+            threshold,
+            market_type,
+            side,
+            strike_type=strike_type,
+            floor_strike=floor_strike,
+            cap_strike=cap_strike,
+        )
         buffer_score = self._temperature_buffer_score(
             nws_temp,
             threshold,
@@ -306,6 +334,20 @@ class EdgeEngine:
                 None,
                 imbalance_score,
             )
+        min_buffer = self._minimum_buffer_for_station(settlement_station, target_date)
+        if raw_buffer < min_buffer:
+            return self._skip(
+                f"Buffer {raw_buffer:.1f}°F below minimum {min_buffer:.1f}°F for {settlement_station}",
+                market_type,
+                threshold,
+                hours_until_settlement,
+                side=side,
+                ask_price=ask_price,
+                nws_probability_yes=nws_probability_yes,
+                nws_temp=nws_temp,
+                ladder_multiplier=ladder_multiplier,
+            )
+
         if not self._nws_agrees(
             nws_temp,
             threshold,
@@ -338,7 +380,8 @@ class EdgeEngine:
             )
 
         model_probability = self._model_probability_for_side(nws_probability_yes, side)
-        ev = self._calculate_ev(model_probability, ask_price)
+        corrected_price = self._correct_market_price(ask_price, side)
+        ev = self._calculate_ev(model_probability, corrected_price)
         if ev < self.min_ev_per_contract:
             return self._skip(
                 f"EV {ev:.4f} below threshold {self.min_ev_per_contract:.4f}",
@@ -353,7 +396,7 @@ class EdgeEngine:
                 imbalance_score=imbalance_score,
             )
 
-        edge = model_probability - ask_price
+        edge = model_probability - corrected_price
         confidence = self._confidence_for_side(nws_probability_yes, side)
 
         required_edge = self._required_edge(market)
@@ -547,6 +590,58 @@ class EdgeEngine:
         del side
         return round(max(0.01, min(0.99, ask_price)), 2)
 
+    @staticmethod
+    def _correct_market_price(raw_price: float, side: str) -> float:
+        """Correct for favorite-longshot bias in Kalshi weather markets (signal only)."""
+        del side
+        if raw_price > 0.85:
+            corrected = raw_price - 0.06
+        elif raw_price > 0.70:
+            corrected = raw_price - 0.03
+        elif raw_price < 0.15:
+            corrected = raw_price + 0.06
+        elif raw_price < 0.30:
+            corrected = raw_price + 0.03
+        else:
+            corrected = raw_price
+        return max(0.02, min(0.98, corrected))
+
+    @staticmethod
+    def _minimum_buffer_for_station(station_id: str, target_date: date) -> float:
+        """Minimum temperature buffer required scales with city sigma (1.5×)."""
+        return get_sigma(station_id, target_date) * 1.5
+
+    def _raw_buffer(
+        self,
+        nws_temp: float | None,
+        threshold: float,
+        market_type: str,
+        side: str,
+        *,
+        strike_type: str = "greater",
+        floor_strike: float | None = None,
+        cap_strike: float | None = None,
+    ) -> float:
+        """Return signed favorable buffer distance in °F (negative = wrong side)."""
+        if nws_temp is None:
+            return -999.0
+
+        if strike_type == "between" and floor_strike is not None and cap_strike is not None:
+            floor, cap = floor_strike, cap_strike
+            inside = floor <= nws_temp <= cap
+            if side == "yes":
+                if inside:
+                    return min(nws_temp - floor, cap - nws_temp)
+                if nws_temp < floor:
+                    return nws_temp - floor
+                return cap - nws_temp
+            if not inside:
+                return (floor - nws_temp) if nws_temp < floor else (nws_temp - cap)
+            return -min(nws_temp - floor, cap - nws_temp)
+        if market_type == "high":
+            return nws_temp - threshold if side == "yes" else threshold - nws_temp
+        return threshold - nws_temp if side == "yes" else nws_temp - threshold
+
     def _temperature_buffer_score(
         self,
         nws_temp: float | None,
@@ -558,35 +653,18 @@ class EdgeEngine:
         floor_strike: float | None = None,
         cap_strike: float | None = None,
     ) -> float:
-        """Score 0.0-1.0 based on how far the forecast favors this side.
-
-        For HIGH greater markets: YES needs forecast above threshold, NO below.
-        For between brackets: YES needs forecast inside [floor, cap], NO outside.
-        """
-        if nws_temp is None:
-            return 0.5
-
-        if strike_type == "between" and floor_strike is not None and cap_strike is not None:
-            floor, cap = floor_strike, cap_strike
-            inside = floor <= nws_temp <= cap
-            if side == "yes":
-                if inside:
-                    buffer = min(nws_temp - floor, cap - nws_temp)
-                elif nws_temp < floor:
-                    buffer = nws_temp - floor
-                else:
-                    buffer = cap - nws_temp
-            else:
-                if not inside:
-                    buffer = (floor - nws_temp) if nws_temp < floor else (nws_temp - cap)
-                else:
-                    buffer = -min(nws_temp - floor, cap - nws_temp)
-        elif market_type == "high":
-            buffer = nws_temp - threshold if side == "yes" else threshold - nws_temp
-        else:
-            buffer = threshold - nws_temp if side == "yes" else nws_temp - threshold
-
-        if buffer >= 5.0:
+        """Score 0.0-1.0 based on how far the forecast favors this side."""
+        buffer = self._raw_buffer(
+            nws_temp,
+            threshold,
+            market_type,
+            side,
+            strike_type=strike_type,
+            floor_strike=floor_strike,
+            cap_strike=cap_strike,
+        )
+        if buffer < 0.0:
+            return 0.0
             return 1.0
         if buffer >= 3.0:
             return 0.8

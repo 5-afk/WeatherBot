@@ -5,11 +5,13 @@ This is a standalone script. It does not call live Kalshi, weather, or Claude AP
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from src.edge_engine import EdgeDecision, EdgeEngine, estimate_probability
 from src.kalshi_client import KalshiMarket
 from src.weather_client import NwsForecast
+
+JULY_4 = date(2026, 7, 4)
 
 
 def test_mia_style_gate_passes() -> None:
@@ -57,7 +59,12 @@ def test_nws_probability_reaches_scoring() -> None:
     )
     nws = NwsForecast(99.0, "hot", "synthetic")
 
-    decision = engine.evaluate(market, nws=nws)
+    decision = engine.evaluate(
+        market,
+        nws=nws,
+        settlement_station="KMIA",
+        target_date=JULY_4,
+    )
 
     assert decision.nws_probability_yes is not None
     assert decision.nws_probability_yes > 0.5
@@ -65,15 +72,21 @@ def test_nws_probability_reaches_scoring() -> None:
 
 
 def test_estimate_probability_high() -> None:
-    """Forecast 95F vs threshold 93F should yield ~72% YES for HIGH market."""
-    prob = estimate_probability(95.0, 93.0, "HIGH")
-    assert 0.68 <= prob <= 0.76, f"expected ~0.72, got {prob}"
+    """Forecast 95F vs threshold 93F should yield high YES prob for Miami summer sigma."""
+    prob = estimate_probability(
+        95.0, 93.0, "HIGH",
+        station_id="KMIA", target_date=JULY_4,
+    )
+    assert prob > 0.85, f"expected high YES prob with tight Miami sigma, got {prob}"
 
 
 def test_estimate_probability_low_side() -> None:
-    """Forecast 95F vs threshold 97F should yield ~28% YES for HIGH market."""
-    prob = estimate_probability(95.0, 97.0, "HIGH")
-    assert 0.24 <= prob <= 0.32, f"expected ~0.28, got {prob}"
+    """Forecast 95F vs threshold 97F should yield low YES prob for Miami summer sigma."""
+    prob = estimate_probability(
+        95.0, 97.0, "HIGH",
+        station_id="KMIA", target_date=JULY_4,
+    )
+    assert prob < 0.20, f"expected low YES prob, got {prob}"
 
 
 if __name__ == "__main__":

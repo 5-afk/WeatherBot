@@ -230,7 +230,12 @@ def main() -> None:
             print(f"\nMarket: {market.ticker}\nCity: {city.name}\nWould bet: NO\nReason: Weather fetch failed: {exc}")
             continue
 
-        decision = edge_engine.evaluate(market, nws=nws)
+        decision = edge_engine.evaluate(
+            market,
+            nws=nws,
+            settlement_station=settlement_station,
+            target_date=target_date,
+        )
         claude: ClaudeDecision | None = None
         size: PositionSize | None = None
         would_bet = False

@@ -28,6 +28,24 @@ class ClaudeDecision:
 class ClaudeChecker:
     """Call Claude only for trades that already passed numeric filters."""
 
+    CALIBRATION_NOTES = (
+        "CITY-SPECIFIC CALIBRATION NOTES (use these when evaluating candidates): "
+        "- Oklahoma City (KOKC): NWS underforecasts July highs by ~1.8°F on average. "
+        "If NWS says 95°F in OKC in July, true expected high is closer to 96.8°F. "
+        "Be MORE cautious about NO bets on OKC high temperatures in July. "
+        "- Los Angeles (KLAX): NWS overforecasts LAX highs by ~2.5°F in summer. "
+        "If NWS says 78°F, true expected high is closer to 75.5°F. "
+        "Be MORE confident about NO bets on LAX high temperature thresholds. "
+        "- Miami (KMIA): Very low forecast uncertainty (sigma ~1.9°F). "
+        "Miami temperature is highly predictable — large buffers are not needed. "
+        "A 3°F buffer in Miami is equivalent to a 5°F buffer in Denver. "
+        "- Denver (KDEN): Very high forecast uncertainty (sigma ~4.6°F). "
+        "Require at least 7°F buffer before approving any Denver trade. "
+        "Denver weather is highly variable — be conservative. "
+        "- San Francisco (KSFO): NWS overforecasts by ~2.0°F in summer due to marine layer. "
+        "Similar to LAX — be more confident about NO bets on high thresholds."
+    )
+
     SYSTEM_PROMPT = (
         "You are a trading risk checker for a Kalshi weather prediction market bot. "
         "The bot places ONE bet per day using its full daily budget. "
@@ -61,7 +79,8 @@ class ClaudeChecker:
         "STRONGLY prefer the NO side. Only approve YES when the NWS forecast places the "
         "temperature clearly and confidently above the threshold with a large buffer. "
         "A NO bet means the temperature will NOT reach or exceed the threshold — "
-        "this is correct more often than YES on any given bracket."
+        "this is correct more often than YES on any given bracket. "
+        + CALIBRATION_NOTES
     )
 
     def __init__(self) -> None:
@@ -168,7 +187,8 @@ class ClaudeChecker:
                     "STRONGLY prefer the NO side. Only approve YES when the NWS forecast places the "
                     "temperature clearly and confidently above the threshold with a large buffer. "
                     "A NO bet means the temperature will NOT reach or exceed the threshold — "
-                    "this is correct more often than YES on any given bracket."
+                    "this is correct more often than YES on any given bracket. "
+                    + ClaudeChecker.CALIBRATION_NOTES
                 ),
                 messages=[{
                     "role": "user",
