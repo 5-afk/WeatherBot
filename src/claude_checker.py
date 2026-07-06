@@ -80,6 +80,13 @@ class ClaudeChecker:
         "temperature clearly and confidently above the threshold with a large buffer. "
         "A NO bet means the temperature will NOT reach or exceed the threshold — "
         "this is correct more often than YES on any given bracket. "
+        "PROFITABILITY REQUIREMENTS — enforce these on every candidate: "
+        "Minimum return: every bet must have potential profit >= 100% of stake (2x total payout minimum). "
+        "This means only approve contracts priced between $0.15 and $0.47. "
+        "If profit_if_wins < stake, return NOGO — the payout doesn't justify the risk. "
+        "The profit_if_wins field in the payload shows exact dollar profit if the bet wins. "
+        "Prefer candidates where profit_if_wins >= 1.5x stake (150%+ return). "
+        "Never approve a bet where the total profit is less than $5.00 — it is not worth the risk. "
         + CALIBRATION_NOTES
     )
 
@@ -188,6 +195,13 @@ class ClaudeChecker:
                     "temperature clearly and confidently above the threshold with a large buffer. "
                     "A NO bet means the temperature will NOT reach or exceed the threshold — "
                     "this is correct more often than YES on any given bracket. "
+                    "PROFITABILITY REQUIREMENTS — enforce these on every candidate: "
+                    "Minimum return: every bet must have potential profit >= 100% of stake (2x total payout minimum). "
+                    "This means only approve contracts priced between $0.15 and $0.47. "
+                    "If profit_if_wins < stake, return NOGO — the payout doesn't justify the risk. "
+                    "The profit_if_wins field in the payload shows exact dollar profit if the bet wins. "
+                    "Prefer candidates where profit_if_wins >= 1.5x stake (150%+ return). "
+                    "Never approve a bet where the total profit is less than $5.00 — it is not worth the risk. "
                     + ClaudeChecker.CALIBRATION_NOTES
                 ),
                 messages=[{

@@ -15,6 +15,7 @@ class PositionSize:
     contracts: int
     kelly_size: float
     reason: str
+    profit_if_wins: float = 0.0
 
 
 class PositionSizer:
@@ -22,11 +23,13 @@ class PositionSizer:
 
     def __init__(self) -> None:
         """Read sizing settings from environment variables."""
-        self.daily_budget = float(os.getenv("DAILY_BUDGET", "100"))
-        self.max_bet_usd = float(os.getenv("MAX_BET_USD", os.getenv("MAX_BET_PER_TRADE", "100")))
-        self.max_bet_pct = float(os.getenv("MAX_BET_PCT", "1.0"))
+        self.min_bet_usd = float(os.getenv("MIN_BET_USD", "10.0"))
+        self.max_bet_usd = float(os.getenv("MAX_BET_USD", "75.0"))
+        self.max_bankroll_deployment = float(os.getenv("MAX_BANKROLL_DEPLOYMENT", "0.70"))
         self.kelly_fraction = float(os.getenv("KELLY_FRACTION", "0.15"))
-        self.reinvest_pct = float(os.getenv("REINVEST_PCT", "0.75"))
+        self.min_return_multiple = float(os.getenv("MIN_RETURN_MULTIPLE", "2.0"))
+        self.min_tradeable_price = float(os.getenv("MIN_TRADEABLE_PRICE", "0.15"))
+        self.max_tradeable_price = float(os.getenv("MAX_TRADEABLE_PRICE", "0.50"))
 
     def size_trade(
         self,
@@ -39,43 +42,73 @@ class PositionSizer:
         previous_payout: float = 0.0,
         last_trade_won: bool = False,
     ) -> PositionSize:
-        """Return final stake and contract count for one proposed bet."""
-        budget = current_budget or self.daily_budget
-        if not 0 < price < 1:
-            return PositionSize(0.0, 0, 0.0, "Invalid price.")
-        if not 0 < win_probability < 1:
-            return PositionSize(0.0, 0, 0.0, "Invalid win probability.")
+        """Binary Kelly sizing with minimum bet enforcement.
 
-        # Cap win probability for Kelly math
-        win_probability = min(win_probability, 0.99)
+        Formula: f* = (p - c) / (1 - c), then multiply by KELLY_FRACTION.
+        """
+        del ladder_multiplier, previous_payout, last_trade_won
+        budget = current_budget if current_budget is not None else float(os.getenv("DAILY_BUDGET", "100"))
 
-        # For one-bet-per-day system: stake = full budget scaled by confidence
-        # Confidence multiplier: 0.70 confidence = 77% of budget, 1.0 = 100%
-        confidence_multiplier = min(1.0, (confidence - 0.70) / 0.30 * 0.40 + 0.60)
-        # Maps: 0.70 confidence -> 60% of budget, 1.0 confidence -> 100% of budget
+        if price <= 0 or price >= 1:
+            return PositionSize(0.0, 0, 0.0, "Invalid price")
 
-        stake = round(min(budget * confidence_multiplier * ladder_multiplier, self.max_bet_usd), 2)
+        if price < self.min_tradeable_price:
+            return PositionSize(
+                0.0, 0, 0.0,
+                f"Price ${price:.2f} below minimum ${self.min_tradeable_price:.2f}",
+            )
+        if price > self.max_tradeable_price:
+            return PositionSize(
+                0.0, 0, 0.0,
+                f"Price ${price:.2f} above maximum ${self.max_tradeable_price:.2f}",
+            )
 
-        # Still apply Kelly as a sanity floor - never bet more than 3x Kelly suggests
-        b = (1 - price) / price
-        q = 1 - win_probability
-        full_kelly = max(0.0, (win_probability * b - q) / b)
-        kelly_size = round(budget * full_kelly * self.kelly_fraction, 2)
-        # If Kelly says less than 10% of budget, something is off - reduce stake
-        if kelly_size < budget * 0.10:
-            stake = round(min(stake, kelly_size * 3), 2)
+        profit_per_dollar = (1.0 - price) / price
+        if profit_per_dollar < (self.min_return_multiple - 1.0):
+            return PositionSize(
+                0.0, 0, 0.0,
+                f"Return {profit_per_dollar:.2f}x below minimum {self.min_return_multiple - 1:.1f}x profit on cost",
+            )
+
+        edge = win_probability - price
+        if edge <= 0:
+            return PositionSize(0.0, 0, 0.0, f"No edge: model={win_probability:.2f} price={price:.2f}")
+
+        full_kelly = edge / (1.0 - price)
+        fractional_kelly = full_kelly * self.kelly_fraction
+
+        conf_multiplier = max(0.60, min(1.0, (confidence - 0.60) / 0.40 + 0.60))
+
+        raw_stake = fractional_kelly * budget * conf_multiplier
+        stake = max(self.min_bet_usd, min(self.max_bet_usd, raw_stake))
+        stake = min(stake, budget * self.max_bankroll_deployment)
+
+        if stake < self.min_bet_usd:
+            return PositionSize(
+                0.0, 0, full_kelly,
+                f"Stake ${stake:.2f} below minimum ${self.min_bet_usd:.2f}",
+            )
 
         contracts = math.floor(stake / price)
         if contracts < 1:
-            return PositionSize(0.0, 0, round(kelly_size, 2), "Final stake buys less than one contract.")
+            return PositionSize(0.0, 0, full_kelly, "Insufficient stake for even 1 contract")
 
         final_stake = round(contracts * price, 2)
+        profit_if_wins = round(contracts * (1.0 - price), 2)
+
+        min_profit = final_stake * (self.min_return_multiple - 1.0)
+        if profit_if_wins < min_profit:
+            return PositionSize(
+                0.0, 0, full_kelly,
+                f"Profit ${profit_if_wins:.2f} below minimum ${min_profit:.2f} required",
+            )
+
         return PositionSize(
             final_stake,
             contracts,
-            round(kelly_size, 2),
-            f"Budget ${budget:.2f} x confidence {confidence_multiplier:.2f} x ladder {ladder_multiplier:.2f} = ${stake:.2f}, "
-            f"Kelly sanity: ${kelly_size:.2f}.",
+            round(full_kelly, 4),
+            "OK",
+            profit_if_wins=profit_if_wins,
         )
 
     def payout_if_win(self, contracts: int) -> float:

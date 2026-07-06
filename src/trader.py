@@ -388,7 +388,7 @@ class Trader:
             self._log_skip(city, market, size.reason, edge)
             return
 
-        risk_check = self.risk.can_trade(market.ticker, size.stake)
+        risk_check = self.risk.can_trade(market.ticker, size.stake, current_budget)
         if not risk_check.allowed:
             logging.warning("[SKIP] Risk check failed: %s", risk_check.reason)
             self._log_skip(city, market, risk_check.reason, edge)
@@ -435,6 +435,17 @@ class Trader:
             rules_primary = str(market_rules.get("rules_primary", ""))
             if not settlement_station:
                 settlement_station = self.weather.parse_settlement_station(rules_primary) or ""
+        price = edge.limit_price or edge.ask_price or 0.0
+        budget = self.risk.get_todays_budget()
+        sized = self.position_sizer.size_trade(
+            win_probability=min(edge.model_probability or 0.99, 0.99),
+            price=price,
+            confidence=edge.confidence,
+            current_budget=budget,
+        )
+        contracts = sized.contracts
+        stake = sized.stake
+        profit_if_wins = sized.profit_if_wins
         return {
             "ticker": market.ticker,
             "city": city.name,
@@ -457,6 +468,11 @@ class Trader:
             "expiration_time": market_rules.get("expiration_time", ""),
             "settlement_station": settlement_station,
             "last_trading_time": market_rules.get("close_time", ""),
+            "proposed_stake": stake,
+            "contracts": contracts,
+            "profit_if_wins": profit_if_wins,
+            "return_multiple": round((1.0 - price) / price, 2) if price > 0 else 0.0,
+            "min_required_profit": round(stake, 2),
         }
 
     def _select_candidate(
@@ -854,8 +870,17 @@ class Trader:
     ) -> None:
         """Notify Discord of a confirmed live fill using the actual fill data."""
         side_label = (edge.side or "yes").upper()
-        payout = filled_count * 1.0
-        profit_if_win = payout - actual_stake
+        price = edge.limit_price or edge.ask_price or 0.0
+        profit_if_wins = round(filled_count * (1.0 - price), 2)
+        return_multiple = round(profit_if_wins / actual_stake, 1) if actual_stake > 0 else 0.0
+        budget = self.risk.get_running_budget()
+        open_count = self.risk.open_position_count()
+        dynamic_max = self.risk.max_positions_for_bet(
+            actual_stake,
+            self.risk.get_todays_budget(),
+        )
+        exposure = self.risk.get_total_open_exposure()
+        deployment_pct = (exposure / budget * 100) if budget > 0 else 0.0
         budget_remaining = self.risk.get_todays_budget()
         title = market.title or market.ticker
         sub = market.subtitle or (f"{edge.threshold_f:.0f}°+" if edge.threshold_f else "")
@@ -863,20 +888,17 @@ class Trader:
             "🎯 BET PLACED — LIVE\n"
             f"Market: {title}\n"
             f"Side: {side_label}" + (f" ({sub})" if sub else "") + "\n"
-            f"Contracts: {filled_count} @ ${edge.limit_price or 0.0:.2f}\n"
+            f"Contracts: {filled_count} @ ${price:.2f}\n"
             f"Total cost: ${actual_stake:.2f}\n"
-            f"Payout if right: ${payout:.2f} (+${profit_if_win:.2f})\n"
+            f"Profit if wins: **+${profit_if_wins:.2f}** ({return_multiple:.1f}x return)\n"
+            f"Positions: {open_count}/{dynamic_max}\n"
+            f"Bankroll deployed: {deployment_pct:.0f}%\n"
             f"Budget remaining: ${budget_remaining:.2f}",
             mention=True,
         )
 
     def check_settlements(self) -> None:
-        """Resolve open live positions that have settled or vanished from Kalshi.
-
-        A position that no longer appears in GET /portfolio/positions has been
-        fully closed or settled — including losses where value went to $0.
-        Runs at most once per hour during live trading.
-        """
+        """Check open positions for settlement. Only book P&L when finalized."""
         if self.dry_run:
             return
 
@@ -886,73 +908,90 @@ class Trader:
             return
         self._last_settlement_check = now
 
-        try:
-            open_positions = self.risk.open_positions_detail()
-        except Exception as exc:
-            logging.warning("Settlement check could not read positions: %s", exc)
-            return
-
-        if not open_positions:
-            return
-
-        live_tickers: set[str] = set()
-        for kalshi_pos in self.kalshi.get_positions():
+        open_positions = self.risk.get_open_live_positions()
+        for position in open_positions:
+            ticker = position["ticker"]
             try:
-                signed = int(float(kalshi_pos.get("position_fp") or 0))
-            except (TypeError, ValueError):
-                signed = 0
-            ticker = str(kalshi_pos.get("ticker", ""))
-            if signed != 0 and ticker:
-                live_tickers.add(ticker)
+                market_obj = self.kalshi.get_market(ticker)
+                if market_obj is None:
+                    logging.debug("[SETTLEMENT] %s — market not found, skipping", ticker)
+                    continue
+                m = market_obj.raw
+                status = str(m.get("status", "")).lower()
+                result = m.get("result")
 
-        any_closed = False
-        for pos in open_positions:
-            ticker = pos["ticker"]
-            if ticker in live_tickers:
-                continue
+                if status not in ("finalized", "settled"):
+                    logging.debug(
+                        "[SETTLEMENT] %s status=%s — not yet finalized, skipping",
+                        ticker,
+                        status,
+                    )
+                    continue
 
-            realized = self.risk.resolve_settled_pnl(self.kalshi, pos)
-            side = str(pos["side"]).lower()
-            contracts = int(pos["contracts"])
-            stake = float(pos["stake"])
+                if not result or str(result).lower() not in ("yes", "no"):
+                    logging.debug(
+                        "[SETTLEMENT] %s status=%s result=%s — no result yet, skipping",
+                        ticker,
+                        status,
+                        result,
+                    )
+                    continue
 
-            market = self.kalshi.get_market(ticker)
-            result = ""
-            if market is not None:
-                result = str(market.raw.get("result", "")).lower()
-            won = (side == result) if result in {"yes", "no"} else realized >= 0
+                side = str(position["side"]).lower()
+                result = str(result).lower()
+                won = side == result
+                contracts = int(position["contracts"])
+                stake = float(position["stake"])
 
-            self.risk.record_resolution(ticker, realized)
-            any_closed = True
+                if won:
+                    payout = contracts * 1.00
+                    pnl = payout - stake
+                    logging.info(
+                        "[SETTLEMENT] WON %s %s | %d contracts | payout $%.2f profit $%.2f",
+                        ticker,
+                        side.upper(),
+                        contracts,
+                        payout,
+                        pnl,
+                    )
+                else:
+                    payout = 0.0
+                    pnl = -stake
+                    logging.info(
+                        "[SETTLEMENT] LOST %s %s | %d contracts | loss -$%.2f",
+                        ticker,
+                        side.upper(),
+                        contracts,
+                        stake,
+                    )
 
-            portfolio = self.kalshi.get_portfolio_balance()
-            new_balance = portfolio["cash"] if portfolio else self.kalshi.get_balance()
-            balance_str = f"${new_balance:.2f}" if new_balance is not None else "unknown"
-            settle_price = 1.00 if won else 0.00
+                self.risk.close_position(ticker, pnl, payout)
+                try:
+                    self.risk.sync_from_kalshi(self.kalshi)
+                except Exception as exc:
+                    logging.warning("[SETTLEMENT] Balance sync failed after %s: %s", ticker, exc)
 
-            if won:
-                self._send_discord(
-                    f"✅ BET WON — {ticker}\n"
-                    f"{side.upper()} {contracts} contracts · settled at ${settle_price:.2f}\n"
-                    f"Profit: +${realized:.2f}\n"
-                    f"New balance: {balance_str}",
-                    mention=True,
-                )
-            else:
-                self._send_discord(
-                    f"❌ BET LOST — {ticker}\n"
-                    f"{side.upper()} {contracts} contracts · settled at ${settle_price:.2f}\n"
-                    f"Loss: -${abs(realized):.2f}\n"
-                    f"New balance: {balance_str}",
-                    mention=True,
-                )
-            logging.info("[SETTLED] %s %s result=%s realized=%.2f", ticker, side, result or "gone", realized)
+                if won:
+                    self._send_discord(
+                        f"✅ **BET WON** — {ticker}\n"
+                        f"{side.upper()} {contracts} contracts\n"
+                        f"Profit: **+${pnl:.2f}**\n"
+                        f"New balance: ${self.risk.get_running_budget():.2f}\n"
+                        f"{self._user_ping()}",
+                        mention=True,
+                    )
+                else:
+                    self._send_discord(
+                        f"❌ **BET LOST** — {ticker}\n"
+                        f"{side.upper()} {contracts} contracts\n"
+                        f"Loss: **-${stake:.2f}**\n"
+                        f"New balance: ${self.risk.get_running_budget():.2f}\n"
+                        f"{self._user_ping()}",
+                        mention=True,
+                    )
 
-        if any_closed:
-            portfolio = self.kalshi.get_portfolio_balance()
-            if portfolio is not None:
-                self.risk._set_state("running_budget", str(portfolio["cash"]))
-                logging.info("[SETTLED] running_budget synced to cash $%.2f", portfolio["cash"])
+            except Exception as exc:
+                logging.warning("[SETTLEMENT] Error checking %s: %s", ticker, exc)
 
     def _user_ping(self) -> str:
         """Return a Discord user mention string for notifications."""

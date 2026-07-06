@@ -114,6 +114,9 @@ class EdgeEngine:
         self.no_side_bias = float(os.getenv("NO_SIDE_BIAS", "1.15"))
         self.min_liquidity = float(os.getenv("MIN_LIQUIDITY_CONTRACTS", "10"))
         self.min_liquidity_new_city = float(os.getenv("MIN_LIQUIDITY_NEW_CITY", "10"))
+        self.min_tradeable_price = float(os.getenv("MIN_TRADEABLE_PRICE", "0.15"))
+        self.max_tradeable_price = float(os.getenv("MAX_TRADEABLE_PRICE", "0.50"))
+        self.min_return_multiple = float(os.getenv("MIN_RETURN_MULTIPLE", "2.0"))
         self._expansion_series = {
             "KXHIGHTSEA", "KXHIGHTSFO", "KXHIGHTDAL", "KXHIGHTMIN",
             "KXHIGHTOKC", "KXHIGHTATL", "KXHIGHTBOS", "KXHIGHTDC",
@@ -273,6 +276,18 @@ class EdgeEngine:
         if ask_price < 0.05:
             return self._skip(
                 f"Ask price ${ask_price:.2f} too low — market effectively resolved (Kalshi rejects orders)",
+                market_type,
+                threshold,
+                hours_until_settlement,
+                side=side,
+                ask_price=ask_price,
+                nws_probability_yes=nws_probability_yes,
+                nws_temp=nws_temp,
+            )
+        price_band_reason = self._check_price_band(ask_price, side)
+        if price_band_reason:
+            return self._skip(
+                price_band_reason,
                 market_type,
                 threshold,
                 hours_until_settlement,
@@ -589,6 +604,26 @@ class EdgeEngine:
         """
         del side
         return round(max(0.01, min(0.99, ask_price)), 2)
+
+    def _check_price_band(self, ask_price: float, side: str) -> str | None:
+        """Enforce price band and minimum return multiple. Returns skip reason or None."""
+        del side
+        if ask_price < self.min_tradeable_price:
+            return (
+                f"Price ${ask_price:.2f} below minimum ${self.min_tradeable_price:.2f} — fee drag too high"
+            )
+        if ask_price > self.max_tradeable_price:
+            return (
+                f"Price ${ask_price:.2f} above ${self.max_tradeable_price:.2f} — "
+                f"violates {self.min_return_multiple}x minimum return"
+            )
+        profit_per_dollar = (1.0 - ask_price) / ask_price
+        if profit_per_dollar < (self.min_return_multiple - 1.0):
+            return (
+                f"Return {profit_per_dollar:.2f}x below minimum "
+                f"{self.min_return_multiple - 1:.1f}x profit on cost"
+            )
+        return None
 
     @staticmethod
     def _correct_market_price(raw_price: float, side: str) -> float:

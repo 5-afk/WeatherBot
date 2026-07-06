@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -32,12 +33,13 @@ class RiskManager:
         self.daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "100"))
         self.monthly_loss_limit = float(os.getenv("MONTHLY_LOSS_LIMIT", "500"))
         self.max_drawdown_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "0.40"))
-        self.max_open_positions = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+        self.max_bankroll_deployment = float(os.getenv("MAX_BANKROLL_DEPLOYMENT", "0.70"))
+        self.position_count_ceiling = int(os.getenv("POSITION_COUNT_CEILING", "6"))
         self.starting_balance = float(os.getenv("STARTING_BALANCE", "100"))
         self.no_duplicate_tickers = True
         self._init_db()
 
-    def can_trade(self, ticker: str, proposed_stake: float) -> RiskCheck:
+    def can_trade(self, ticker: str, proposed_stake: float, current_budget: float | None = None) -> RiskCheck:
         """Check all hard stops before a bet is allowed."""
         if self._get_state("permanent_halt") == "true":
             return RiskCheck(False, "Permanent halt active after drawdown breach.", True)
@@ -45,8 +47,25 @@ class RiskManager:
             return RiskCheck(False, f"Already have open position on {ticker}.")
         if self.no_duplicate_tickers and self.has_ever_traded(ticker):
             return RiskCheck(False, f"No duplicate tickers: {ticker} was already traded.")
-        if self.open_position_count() >= self.max_open_positions:
-            return RiskCheck(False, f"Max open positions reached ({self.max_open_positions}).")
+
+        budget = current_budget if current_budget is not None else self.get_todays_budget()
+        open_count = self.open_position_count()
+        max_pos = self.max_positions_for_bet(proposed_stake, budget)
+        if open_count >= max_pos:
+            return RiskCheck(
+                False,
+                f"At dynamic position limit {open_count}/{max_pos} "
+                f"(${proposed_stake:.2f} bets on ${budget:.2f} bankroll)",
+            )
+
+        current_exposure = self.get_total_open_exposure()
+        if current_exposure + proposed_stake > budget * self.max_bankroll_deployment:
+            return RiskCheck(
+                False,
+                f"Adding ${proposed_stake:.2f} would exceed 70% deployment limit "
+                f"(current exposure ${current_exposure:.2f})",
+            )
+
         if proposed_stake > self.max_bet_usd:
             return RiskCheck(False, f"Stake ${proposed_stake:.2f} exceeds max bet ${self.max_bet_usd:.2f}.")
         todays_budget = self.get_todays_budget()
@@ -278,6 +297,15 @@ class RiskManager:
             ticker = pos["ticker"]
             if ticker in live_tickers:
                 continue
+            market = kalshi.get_market(ticker)
+            if market is None:
+                continue
+            status = str(market.raw.get("status", "")).lower()
+            result = market.raw.get("result")
+            if status not in {"finalized", "settled"}:
+                continue
+            if not result or str(result).lower() not in {"yes", "no"}:
+                continue
             realized = self.resolve_settled_pnl(kalshi, pos)
             self.record_resolution(ticker, realized)
             if realized >= 0:
@@ -306,12 +334,37 @@ class RiskManager:
         if market is not None:
             status = str(market.raw.get("status", "")).lower()
             result = str(market.raw.get("result", "")).lower()
-            if status in {"settled", "finalized", "closed"} and result in {"yes", "no"}:
+            if status in {"settled", "finalized"} and result in {"yes", "no"}:
                 won = side == result
                 if won:
                     return round(contracts * 1.0 - stake, 2)
                 return round(-stake, 2)
-        return round(-stake, 2)
+        return round(-stake, 2)  # legacy fallback when market metadata unavailable
+
+    def get_open_live_positions(self) -> list[dict]:
+        """Return open live positions for settlement processing."""
+        return self.open_positions_detail()
+
+    def max_positions_for_bet(self, bet_size: float, current_budget: float) -> int:
+        """Dynamic position limit: floor(0.70 x bankroll / bet_size), capped."""
+        if bet_size <= 0 or current_budget <= 0:
+            return 1
+        dynamic_max = math.floor((self.max_bankroll_deployment * current_budget) / bet_size)
+        return max(1, min(self.position_count_ceiling, dynamic_max))
+
+    def get_total_open_exposure(self) -> float:
+        """Sum of actual cost of all currently open live positions."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(stake), 0.0) FROM positions "
+                "WHERE status='open' AND dry_run=0"
+            ).fetchone()
+        return float(row[0])
+
+    def close_position(self, ticker: str, pnl: float, payout: float) -> None:
+        """Close an open position and record realized P&L."""
+        del payout
+        self.record_resolution(ticker, pnl)
 
     def open_position_count(self) -> int:
         """Count live open positions, excluding dry-run rows.
@@ -472,3 +525,18 @@ class RiskManager:
     def _now() -> str:
         """Return the current UTC timestamp as ISO-8601 text."""
         return datetime.now(timezone.utc).isoformat()
+
+
+def should_settle(market: dict[str, object]) -> bool:
+    """Return True only when Kalshi reports a finalized result."""
+    status = str(market.get("status", "")).lower()
+    result = market.get("result")
+    if status not in {"finalized", "settled"}:
+        return False
+    return result in {"yes", "no"}
+
+
+def can_trade_exposure_check(current_exposure: float, new_stake: float, budget: float) -> bool:
+    """Return True if adding new_stake stays within 70% bankroll deployment."""
+    max_deployment = float(os.getenv("MAX_BANKROLL_DEPLOYMENT", "0.70"))
+    return current_exposure + new_stake <= budget * max_deployment

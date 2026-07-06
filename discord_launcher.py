@@ -186,7 +186,8 @@ class BotLauncher:
             paused = "Yes" if (PROJECT_ROOT / "data" / "paused.flag").exists() else "No"
             last_scan = launcher._last_scan_time()
             window = launcher._scan_window()
-            max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+            dynamic_max = launcher._dynamic_max_positions(state)
+            position_line = f"Open positions: {state['open_positions']} / {dynamic_max} (dynamic)"
             if launcher._is_running():
                 await ctx.send(
                     "🤖 KalshiBot Status\n"
@@ -195,7 +196,7 @@ class BotLauncher:
                     f"Running budget: ${state['running_budget']:.2f} (compounded)\n"
                     f"{balance_line}\n"
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
-                    f"Open positions: {state['open_positions']} / {max_positions}\n"
+                    f"{position_line}\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
                     f"Scan window: {window}\n"
                     f"Paused: {paused}\n"
@@ -212,7 +213,7 @@ class BotLauncher:
                     f"Running budget: ${state['running_budget']:.2f} (compounded)\n"
                     f"{balance_line}\n"
                     f"Total pocketed: ${state['total_pocketed']:.2f}\n"
-                    f"Open positions: {state['open_positions']} / {max_positions}\n"
+                    f"{position_line}\n"
                     f"Daily P&L: ${state['daily_pnl']:.2f}\n"
                     f"Scan window: {window}\n"
                     f"Paused: {paused}\n"
@@ -711,6 +712,19 @@ class BotLauncher:
         except Exception:
             return default
 
+    def _dynamic_max_positions(self, state: dict) -> int:
+        """Estimate max open positions at minimum bet size for current bankroll."""
+        import math
+
+        min_bet = float(os.getenv("MIN_BET_USD", "10.0"))
+        max_deployment = float(os.getenv("MAX_BANKROLL_DEPLOYMENT", "0.70"))
+        ceiling = int(os.getenv("POSITION_COUNT_CEILING", "6"))
+        bankroll = float(state.get("running_budget") or state.get("todays_budget") or 0.0)
+        if min_bet <= 0 or bankroll <= 0:
+            return 1
+        dynamic_max = math.floor((max_deployment * bankroll) / min_bet)
+        return max(1, min(ceiling, dynamic_max))
+
     def _open_positions_report(self) -> str:
         """Build a Discord-friendly report of live open positions with P&L."""
         client = KalshiClient()
@@ -725,7 +739,8 @@ class BotLauncher:
                 continue
             rows.append((pos, contracts_signed))
 
-        max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
+        state = self._db_status()
+        max_positions = self._dynamic_max_positions(state)
         if not rows:
             return f"📊 Open Positions (0/{max_positions})\nNo open positions on Kalshi."
 

@@ -248,15 +248,16 @@ def main() -> None:
             if claude.approved:
                 mock_market_price = float(raw["yes_ask_dollars"])
                 trade_price = decision.limit_price or decision.ask_price or mock_market_price
+                current_budget = risk_manager.get_todays_budget()
                 size = position_sizer.size_trade(
                     win_probability=min(decision.model_probability or 0.99, 0.99),
                     price=trade_price,
                     confidence=decision.confidence,
-                    current_budget=risk_manager.get_todays_budget(),
+                    current_budget=current_budget,
                     previous_payout=0.0,
                     last_trade_won=False,
                 )
-                risk_check = risk_manager.can_trade(market.ticker, size.stake)
+                risk_check = risk_manager.can_trade(market.ticker, size.stake, current_budget)
                 would_bet = size.contracts > 0 and risk_check.allowed
                 if not risk_check.allowed:
                     claude = ClaudeDecision(claude.decision, f"{claude.reason} Risk check: {risk_check.reason}")
