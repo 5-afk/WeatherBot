@@ -537,6 +537,35 @@ class BotLauncher:
                     "Lower limit price to 1¢ if you want immediate fill at any price."
                 )
 
+        @self.bot.command(name="metar")
+        async def metar_cmd(ctx, station: str | None = None):
+            """Show real-time METAR observation for a settlement station."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            if not station:
+                await ctx.send("Usage: `!metar KLAX` or `!metar KNYC`")
+                return
+            station = station.upper()
+            from src.metar_tracker import MetarTracker
+
+            tracker = MetarTracker()
+            obs = tracker.update_station(station)
+            if not obs:
+                await ctx.send(f"❌ Could not fetch METAR for {station}")
+                return
+            daily_max = obs.get("daily_max_f", obs["temp_f"])
+            trend = tracker.get_temperature_trend(station) or "insufficient data"
+            await ctx.send(
+                f"🌡️ **{station} Live METAR**\n"
+                f"Current temp: **{obs['temp_f']:.1f}°F**\n"
+                f"Today's max so far: **{daily_max:.1f}°F**\n"
+                f"Trend: {trend}\n"
+                f"Wind: {obs.get('wind_speed_kt', 'N/A')}kt @ {obs.get('wind_dir', 'N/A')}°\n"
+                f"Sky: {obs.get('sky_cover', 'N/A')}\n"
+                f"Observed: {obs.get('obs_time_utc', 'N/A')} UTC\n"
+                f"Raw: `{obs.get('raw_metar', 'N/A')}`"
+            )
+
         @self.bot.command(name="ps")
         async def ps_cmd(ctx):
             """Show discord_launcher processes for remote diagnostics."""
@@ -607,6 +636,7 @@ class BotLauncher:
                 "!syncpositions — sync open Kalshi positions into local DB\n"
                 "!auditpositions — audit all open positions, auto-sell if needed\n"
                 "!sellposition <ticker> — manually sell a specific open position\n"
+                "!metar <station> — show live METAR temperature for a station\n"
                 "!resetstate — sync cash balance and close settled positions\n"
                 "!clearhalt — clear permanent halt and reset drawdown to current balance\n"
                 "!logs    — show last 30 log lines\n"
@@ -656,7 +686,7 @@ class BotLauncher:
 
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
-            "status", "balance", "positions", "syncpositions", "auditpositions", "sellposition",
+            "status", "balance", "positions", "syncpositions", "auditpositions", "sellposition", "metar",
             "resetstate", "clearhalt", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }

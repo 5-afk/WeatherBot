@@ -87,6 +87,18 @@ class ClaudeChecker:
         "The profit_if_wins field in the payload shows exact dollar profit if the bet wins. "
         "Prefer candidates where profit_if_wins >= 1.5x stake (150%+ return). "
         "Never approve a bet where the total profit is less than $5.00 — it is not worth the risk. "
+        "REAL-TIME OBSERVATION DATA: "
+        "You will receive observed_daily_max_f — the actual running daily maximum temperature "
+        "recorded at the settlement station from live METAR observations. This is the same "
+        "measurement the NWS Daily Climate Report will use for settlement. "
+        "If observed_daily_max_f already EXCEEDS the threshold for a YES market → the market "
+        "has effectively already resolved YES. Approve YES bets strongly, reject NO bets. "
+        "If hours_of_heating_remaining < 2 and observed_daily_max_f is more than 3°F BELOW "
+        "the threshold → the market has effectively already resolved NO. Approve NO bets "
+        "strongly, reject YES bets. "
+        "metar_resolved_direction tells you what the current observations imply. "
+        "temperature_trend tells you if temperature is still rising, falling, or stable. "
+        "Always weight real observed data more heavily than forecast models. "
         + CALIBRATION_NOTES
     )
 
@@ -202,6 +214,18 @@ class ClaudeChecker:
                     "The profit_if_wins field in the payload shows exact dollar profit if the bet wins. "
                     "Prefer candidates where profit_if_wins >= 1.5x stake (150%+ return). "
                     "Never approve a bet where the total profit is less than $5.00 — it is not worth the risk. "
+                    "REAL-TIME OBSERVATION DATA: "
+                    "You will receive observed_daily_max_f — the actual running daily maximum temperature "
+                    "recorded at the settlement station from live METAR observations. This is the same "
+                    "measurement the NWS Daily Climate Report will use for settlement. "
+                    "If observed_daily_max_f already EXCEEDS the threshold for a YES market → the market "
+                    "has effectively already resolved YES. Approve YES bets strongly, reject NO bets. "
+                    "If hours_of_heating_remaining < 2 and observed_daily_max_f is more than 3°F BELOW "
+                    "the threshold → the market has effectively already resolved NO. Approve NO bets "
+                    "strongly, reject YES bets. "
+                    "metar_resolved_direction tells you what the current observations imply. "
+                    "temperature_trend tells you if temperature is still rising, falling, or stable. "
+                    "Always weight real observed data more heavily than forecast models. "
                     + ClaudeChecker.CALIBRATION_NOTES
                 ),
                 messages=[{

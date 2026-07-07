@@ -18,6 +18,7 @@ import requests
 from src.bot_control import is_paused
 from src.claude_checker import ClaudeChecker, ClaudeDecision
 from src.edge_engine import EdgeDecision, EdgeEngine, estimate_probability
+from src.metar_tracker import MetarTracker
 from src.kalshi_client import KalshiClient, KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
 from src.risk_manager import RiskManager
@@ -89,6 +90,7 @@ class Trader:
         self.pnl_path = DATA_DIR / "pnl.json"
         self.kalshi = KalshiClient()
         self.weather = WeatherClient()
+        self.metar = MetarTracker()
         self.edge_engine = EdgeEngine()
         self.claude = ClaudeChecker()
         self.position_sizer = PositionSizer()
@@ -187,6 +189,15 @@ class Trader:
                     [market.yes_ask for market in markets if market.yes_ask is not None]
                 )
                 market_rows.extend((city, market, ladder_multiplier) for market in markets)
+
+        active_stations: set[str] = set()
+        for _city, market, _ladder in market_rows:
+            rules_primary = self._rules_primary_for_market(market)
+            station = self.weather.parse_settlement_station(rules_primary)
+            if station:
+                active_stations.add(station)
+        if active_stations:
+            self.metar.update_all_stations(sorted(active_stations))
 
         candidates: list[tuple[CityConfig, KalshiMarket, EdgeDecision]] = []
         total_checked = len(market_rows)
@@ -331,6 +342,17 @@ class Trader:
 
         current_temp_f = self._current_temp_f(settlement_station)
         imbalance_score = self._fetch_imbalance(market)
+        threshold = self.edge_engine.parse_threshold(market)
+        hours_until = self.edge_engine.hours_until_settlement(settlement_time)
+        strike_type = self.edge_engine.strike_type(market)
+        metar_assessment = self.metar.assess_market_vs_observation(
+            settlement_station,
+            threshold_f=threshold or 0.0,
+            side="yes",
+            strike_type=strike_type,
+            market_type=market_type.upper(),
+            hours_until_settlement=hours_until or 24.0,
+        )
         edge = self.edge_engine.evaluate(
             market,
             nws=nws,
@@ -339,6 +361,7 @@ class Trader:
             current_temp_f=current_temp_f,
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
+            metar_assessment=metar_assessment,
         )
         if not edge.should_trade:
             if edge.reason.startswith("Pre-Claude gate failed"):
@@ -446,6 +469,7 @@ class Trader:
         contracts = sized.contracts
         stake = sized.stake
         profit_if_wins = sized.profit_if_wins
+        metar = edge.metar_assessment or {}
         return {
             "ticker": market.ticker,
             "city": city.name,
@@ -473,6 +497,13 @@ class Trader:
             "profit_if_wins": profit_if_wins,
             "return_multiple": round((1.0 - price) / price, 2) if price > 0 else 0.0,
             "min_required_profit": round(stake, 2),
+            "observed_daily_max_f": metar.get("observed_max_f"),
+            "current_station_temp_f": metar.get("current_temp_f"),
+            "metar_resolved_direction": metar.get("resolved_direction"),
+            "metar_confidence": metar.get("confidence"),
+            "metar_reason": metar.get("reason"),
+            "temperature_trend": metar.get("trend"),
+            "hours_of_heating_remaining": metar.get("hours_of_heating_remaining"),
         }
 
     def _select_candidate(

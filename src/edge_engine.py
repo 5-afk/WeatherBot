@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 
 from src.kalshi_client import KalshiMarket
@@ -89,6 +89,7 @@ class EdgeDecision:
     signal_score: float = 0.5
     ev: float | None = None
     imbalance_score: float = 0.5
+    metar_assessment: dict | None = None
 
 
 class EdgeEngine:
@@ -139,6 +140,7 @@ class EdgeEngine:
         current_temp_f: float | None = None,
         ladder_multiplier: float = 1.0,
         imbalance_score: float = 0.5,
+        metar_assessment: dict | None = None,
     ) -> EdgeDecision:
         """Return a complete GO/skip decision before Claude and risk checks."""
         market_type = self.market_type(market)
@@ -190,6 +192,12 @@ class EdgeEngine:
             hours_until_settlement=hours_until_settlement,
             sigma_multiplier=sigma_multiplier,
         )
+        nws_probability_yes = self._blend_metar_probability(
+            nws_probability_yes,
+            metar_assessment,
+            hours_until_settlement,
+            market.ticker,
+        )
 
         side_kwargs = dict(
             settlement_station=settlement_station,
@@ -211,14 +219,15 @@ class EdgeEngine:
 
         passing = [d for d in (yes_decision, no_decision) if d.should_trade]
         if passing:
-            return max(passing, key=lambda d: (0 if d.side == "no" else 1, -(d.ev or 0.0)))
+            chosen = max(passing, key=lambda d: (0 if d.side == "no" else 1, -(d.ev or 0.0)))
+            return replace(chosen, metar_assessment=metar_assessment)
 
         yes_wrong_side = (
             not yes_decision.should_trade
             and "wrong side of threshold" in yes_decision.reason.lower()
         )
         if yes_wrong_side and no_decision.should_trade:
-            return no_decision
+            return replace(no_decision, metar_assessment=metar_assessment)
         if yes_wrong_side and no_decision.ev is not None and no_decision.buffer_score > 0:
             logging.debug(
                 "YES buffer failed for %s — NO side ev=%.4f buffer=%.2f reason=%s",
@@ -230,8 +239,41 @@ class EdgeEngine:
 
         candidates = [yes_decision, no_decision]
         if yes_wrong_side:
-            return max(candidates, key=lambda d: (0 if d.side == "no" else 1, d.ev if d.ev is not None else -999.0))
-        return max(candidates, key=lambda d: d.ev if d.ev is not None else -999.0)
+            chosen = max(candidates, key=lambda d: (0 if d.side == "no" else 1, d.ev if d.ev is not None else -999.0))
+            return replace(chosen, metar_assessment=metar_assessment)
+        chosen = max(candidates, key=lambda d: d.ev if d.ev is not None else -999.0)
+        return replace(chosen, metar_assessment=metar_assessment)
+
+    @staticmethod
+    def _blend_metar_probability(
+        nws_probability_yes: float,
+        metar_assessment: dict | None,
+        hours_until_settlement: float | None,
+        ticker: str,
+    ) -> float:
+        """Blend NWS forecast probability with METAR-derived resolution signal."""
+        if not metar_assessment or metar_assessment.get("resolved_direction") == "uncertain":
+            return nws_probability_yes
+
+        hours_until = hours_until_settlement if hours_until_settlement is not None else 24.0
+        metar_confidence = float(metar_assessment["confidence"])
+        metar_direction = metar_assessment["resolved_direction"]
+        metar_weight = min(0.80, (1 - hours_until / 24) * 0.80)
+        nws_weight = 1.0 - metar_weight
+        metar_prob = metar_confidence if metar_direction == "yes" else (1.0 - metar_confidence)
+        blended_prob = (nws_weight * nws_probability_yes) + (metar_weight * metar_prob)
+        logging.info(
+            "[METAR SIGNAL] %s | obs_max=%.1f°F | direction=%s | conf=%.2f | "
+            "NWS_prob=%.2f metar_prob=%.2f blended=%.2f",
+            ticker,
+            float(metar_assessment.get("observed_max_f") or 0),
+            metar_direction,
+            metar_confidence,
+            nws_probability_yes,
+            metar_prob,
+            blended_prob,
+        )
+        return round(blended_prob, 4)
 
     def _evaluate_side(
         self,

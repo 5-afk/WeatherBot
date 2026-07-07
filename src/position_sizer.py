@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -52,7 +53,9 @@ class PositionSizer:
         if price <= 0 or price >= 1:
             return PositionSize(0.0, 0, 0.0, "Invalid price")
 
-        if price < self.min_tradeable_price:
+        cheap_high_ev = price < 0.15 and win_probability > 0.80
+
+        if price < self.min_tradeable_price and not cheap_high_ev:
             return PositionSize(
                 0.0, 0, 0.0,
                 f"Price ${price:.2f} below minimum ${self.min_tradeable_price:.2f}",
@@ -80,6 +83,22 @@ class PositionSizer:
         conf_multiplier = max(0.60, min(1.0, (confidence - 0.60) / 0.40 + 0.60))
 
         raw_stake = fractional_kelly * budget * conf_multiplier
+
+        if cheap_high_ev:
+            confidence_scale = 1.0 + (win_probability - 0.80) / 0.15
+            cheap_stake = min(
+                self.min_bet_usd * confidence_scale,
+                budget * 0.20,
+                self.max_bet_usd,
+            )
+            raw_stake = max(raw_stake, cheap_stake)
+            logging.info(
+                "[SIZER] Cheap high-EV contract (price=%.2f, win_prob=%.2f) → boosted stake to $%.2f",
+                price,
+                win_probability,
+                raw_stake,
+            )
+
         stake = max(self.min_bet_usd, min(self.max_bet_usd, raw_stake))
         stake = min(stake, budget * self.max_bankroll_deployment)
 
@@ -90,6 +109,8 @@ class PositionSizer:
             )
 
         contracts = math.floor(stake / price)
+        if cheap_high_ev and contracts * price < self.min_bet_usd:
+            contracts = math.ceil(self.min_bet_usd / price)
         if contracts < 1:
             return PositionSize(0.0, 0, full_kelly, "Insufficient stake for even 1 contract")
 
