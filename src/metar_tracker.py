@@ -1,17 +1,18 @@
 """
 Real-time METAR observation tracker for Kalshi weather market trading.
 
-Polls aviationweather.gov to track the running daily maximum temperature at each
-settlement station. ASOS stations record temperature every minute; the running
-daily max is a live preview of what the NWS Daily Climate Report will publish.
+Polls aviationweather.gov to track running daily maximum and minimum temperatures
+at each settlement station.
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 import zoneinfo
 from datetime import date, datetime
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -19,7 +20,7 @@ import requests
 
 
 class MetarTracker:
-    """Tracks real-time METAR observations and running daily maximums."""
+    """Tracks real-time METAR observations and running daily max/min values."""
 
     METAR_API = "https://aviationweather.gov/api/data/metar"
     HEADERS = {"User-Agent": "WhetherBot/1.0 weather-trading-bot"}
@@ -40,11 +41,16 @@ class MetarTracker:
         "KMSP": "America/Chicago",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | Path = "data/metar_obs.db") -> None:
         self._lock = Lock()
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._daily_max: dict[str, dict[str, float]] = {}
+        self._daily_min: dict[str, dict[str, float]] = {}
         self._last_obs: dict[str, dict[str, Any]] = {}
         self._obs_history: dict[str, list[dict[str, Any]]] = {}
+        self._init_db()
+        self._load_daily_obs()
 
     def fetch_metar(self, station_id: str) -> dict[str, Any] | None:
         """Fetch latest METAR for a single station from aviationweather.gov."""
@@ -83,20 +89,27 @@ class MetarTracker:
             return None
 
     def update_station(self, station_id: str) -> dict[str, Any] | None:
-        """Fetch latest METAR, update running daily max, return enriched observation."""
+        """Fetch latest METAR, update running daily max/min, return enriched observation."""
         obs = self.fetch_metar(station_id)
         if obs is None:
             return None
 
         temp_f = obs["temp_f"]
-        today = date.today().isoformat()
+        today = self._local_date(station_id)
 
         with self._lock:
             if station_id not in self._daily_max:
                 self._daily_max[station_id] = {}
+            if station_id not in self._daily_min:
+                self._daily_min[station_id] = {}
+
             current_max = self._daily_max[station_id].get(today, -999.0)
             new_max = max(current_max, temp_f)
             self._daily_max[station_id][today] = new_max
+
+            current_min = self._daily_min[station_id].get(today, 999.0)
+            new_min = min(current_min, temp_f)
+            self._daily_min[station_id][today] = new_min
 
             self._last_obs[station_id] = obs
 
@@ -109,23 +122,34 @@ class MetarTracker:
             self._obs_history[station_id] = self._obs_history[station_id][-24:]
 
             obs["daily_max_f"] = new_max
+            obs["daily_min_f"] = new_min
             obs["new_daily_max"] = new_max > current_max and current_max > -999.0
+            obs["new_daily_min"] = new_min < current_min and current_min < 999.0
             obs["is_peak_heating_hour"] = self._is_peak_heating_hour(station_id)
 
+            self._save_daily_obs(station_id, today, new_max, new_min)
+
         logging.info(
-            "[METAR] %s | Current: %.1f°F | Daily max: %.1f°F | %s",
+            "[METAR] %s | Current: %.1f°F | Daily max: %.1f°F | Daily min: %.1f°F | %s",
             station_id,
             temp_f,
             new_max,
+            new_min,
             obs["obs_time_utc"],
         )
         return obs
 
     def get_daily_max(self, station_id: str, target_date: date | None = None) -> float | None:
         """Get the observed daily max for a station on a given date."""
-        date_str = (target_date or date.today()).isoformat()
+        date_str = target_date.isoformat() if target_date else self._local_date(station_id)
         with self._lock:
             return self._daily_max.get(station_id, {}).get(date_str)
+
+    def get_daily_min(self, station_id: str, target_date: date | None = None) -> float | None:
+        """Get the observed daily min for a station on a given date."""
+        date_str = target_date.isoformat() if target_date else self._local_date(station_id)
+        with self._lock:
+            return self._daily_min.get(station_id, {}).get(date_str)
 
     def get_last_observation(self, station_id: str) -> dict[str, Any] | None:
         """Get the most recent METAR observation for a station."""
@@ -154,13 +178,15 @@ class MetarTracker:
         strike_type: str,
         market_type: str,
         hours_until_settlement: float,
+        upper_threshold_f: float | None = None,
     ) -> dict[str, Any]:
-        """Compare observed daily max vs market threshold to assess trade quality."""
+        """Compare observed daily max/min vs market threshold to assess trade quality."""
         obs_max = self.get_daily_max(station_id)
+        obs_min = self.get_daily_min(station_id)
         last_obs = self.get_last_observation(station_id)
         trend = self.get_temperature_trend(station_id)
 
-        if obs_max is None or last_obs is None:
+        if obs_max is None or obs_min is None or last_obs is None:
             return {
                 "resolved_direction": "uncertain",
                 "confidence": 0.0,
@@ -172,18 +198,89 @@ class MetarTracker:
         is_peak = self._is_peak_heating_hour(station_id)
         local_hour = self._get_local_hour(station_id)
         hours_of_heating_remaining = max(0, 16 - local_hour)
+        hours_of_cooling_remaining = self._hours_of_cooling_remaining(station_id)
+        strike = strike_type.lower()
+        mt = market_type.upper()
+        upper = upper_threshold_f if upper_threshold_f is not None else threshold_f + 2.0
 
         result: dict[str, Any] = {
             "observed_max_f": obs_max,
+            "observed_min_f": obs_min,
             "current_temp_f": current_temp,
             "trend": trend,
             "local_hour": local_hour,
             "hours_of_heating_remaining": hours_of_heating_remaining,
+            "hours_of_cooling_remaining": hours_of_cooling_remaining,
             "is_peak_heating_hour": is_peak,
         }
 
-        mt = market_type.upper()
-        if mt == "HIGH" and strike_type == "greater":
+        if strike == "between":
+            lower = threshold_f
+            upper = upper_threshold_f if upper_threshold_f is not None else threshold_f + 2.0
+
+            if obs_max > upper:
+                result.update({
+                    "resolved_direction": "no",
+                    "confidence": 0.95,
+                    "recommendation": "strong_buy" if side == "no" else "strong_sell",
+                    "reason": (
+                        f"Observed max {obs_max:.1f}°F already exceeded bracket ceiling "
+                        f"{upper:.1f}°F — YES impossible"
+                    ),
+                })
+            elif lower <= obs_max <= upper:
+                if trend == "rising" and is_peak:
+                    result.update({
+                        "resolved_direction": "uncertain",
+                        "confidence": 0.55,
+                        "recommendation": "hold",
+                        "reason": (
+                            f"Observed max {obs_max:.1f}°F currently IN bracket "
+                            f"[{lower:.1f}-{upper:.1f}°F] but still rising"
+                        ),
+                    })
+                elif trend in ("stable", "falling") and hours_of_heating_remaining < 2:
+                    result.update({
+                        "resolved_direction": "yes",
+                        "confidence": 0.75,
+                        "recommendation": "strong_buy" if side == "yes" else "strong_sell",
+                        "reason": (
+                            f"Observed max {obs_max:.1f}°F stable in bracket "
+                            f"[{lower:.1f}-{upper:.1f}°F] with little heating left"
+                        ),
+                    })
+                else:
+                    result.update({
+                        "resolved_direction": "uncertain",
+                        "confidence": 0.5,
+                        "recommendation": "hold",
+                        "reason": (
+                            f"Observed max {obs_max:.1f}°F in bracket [{lower:.1f}-{upper:.1f}°F], "
+                            f"trend={trend}, {hours_of_heating_remaining:.0f}h heating left"
+                        ),
+                    })
+            elif obs_max < lower and hours_of_heating_remaining < 1:
+                result.update({
+                    "resolved_direction": "no",
+                    "confidence": 0.90,
+                    "recommendation": "strong_buy" if side == "no" else "strong_sell",
+                    "reason": (
+                        f"Observed max {obs_max:.1f}°F below bracket floor {lower:.1f}°F "
+                        "with heating over"
+                    ),
+                })
+            else:
+                result.update({
+                    "resolved_direction": "uncertain",
+                    "confidence": 0.5,
+                    "recommendation": "hold",
+                    "reason": (
+                        f"Observed max {obs_max:.1f}°F, bracket [{lower:.1f}-{upper:.1f}°F], "
+                        f"{hours_of_heating_remaining:.0f}h heating remaining"
+                    ),
+                })
+
+        elif mt == "HIGH" and strike == "greater":
             buffer = obs_max - threshold_f
 
             if obs_max > threshold_f:
@@ -227,6 +324,71 @@ class MetarTracker:
                         f"{hours_of_heating_remaining:.0f}h heating remaining, trend={trend}"
                     ),
                 })
+
+        elif mt == "LOW" and strike == "greater":
+            if obs_min > threshold_f:
+                result.update({
+                    "resolved_direction": "yes",
+                    "confidence": min(1.0, 0.85 + (obs_min - threshold_f) / 10 * 0.15),
+                    "recommendation": "strong_buy" if side == "yes" else "strong_sell",
+                    "reason": (
+                        f"Observed daily min {obs_min:.1f}°F already exceeds "
+                        f"{threshold_f:.1f}°F threshold — YES effectively resolved"
+                    ),
+                })
+            elif hours_of_cooling_remaining < 2 and obs_min <= threshold_f:
+                result.update({
+                    "resolved_direction": "no",
+                    "confidence": min(1.0, 0.80 + (threshold_f - obs_min) / 10 * 0.15),
+                    "recommendation": "strong_buy" if side == "no" else "strong_sell",
+                    "reason": (
+                        f"Only {hours_of_cooling_remaining:.0f}h of cooling left, daily min "
+                        f"{obs_min:.1f}°F has not exceeded {threshold_f:.1f}°F — NO likely"
+                    ),
+                })
+            else:
+                result.update({
+                    "resolved_direction": "uncertain",
+                    "confidence": 0.5,
+                    "recommendation": "hold",
+                    "reason": (
+                        f"Observed min {obs_min:.1f}°F, threshold {threshold_f:.1f}°F, "
+                        f"{hours_of_cooling_remaining:.0f}h cooling remaining, trend={trend}"
+                    ),
+                })
+
+        elif mt == "LOW" and strike in {"less", "less_than", "less than"}:
+            if obs_min < threshold_f:
+                result.update({
+                    "resolved_direction": "yes",
+                    "confidence": min(1.0, 0.85 + (threshold_f - obs_min) / 10 * 0.15),
+                    "recommendation": "strong_buy" if side == "yes" else "strong_sell",
+                    "reason": (
+                        f"Observed daily min {obs_min:.1f}°F already below "
+                        f"{threshold_f:.1f}°F threshold — YES confirmed"
+                    ),
+                })
+            elif current_temp > threshold_f + 10 and hours_of_cooling_remaining < 3:
+                result.update({
+                    "resolved_direction": "no",
+                    "confidence": 0.75,
+                    "recommendation": "strong_buy" if side == "no" else "strong_sell",
+                    "reason": (
+                        f"Current temp {current_temp:.1f}°F far above {threshold_f:.1f}°F "
+                        f"with only {hours_of_cooling_remaining:.0f}h cooling left — NO likely"
+                    ),
+                })
+            else:
+                result.update({
+                    "resolved_direction": "uncertain",
+                    "confidence": 0.5,
+                    "recommendation": "hold",
+                    "reason": (
+                        f"Observed min {obs_min:.1f}°F, threshold {threshold_f:.1f}°F, "
+                        f"current {current_temp:.1f}°F, trend={trend}"
+                    ),
+                })
+
         else:
             result.update({
                 "resolved_direction": "uncertain",
@@ -236,6 +398,66 @@ class MetarTracker:
             })
 
         return result
+
+    def _init_db(self) -> None:
+        """Create the METAR daily observation table if needed."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metar_daily_obs (
+                    station_id TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    daily_max_f REAL NOT NULL,
+                    daily_min_f REAL NOT NULL,
+                    PRIMARY KEY (station_id, date)
+                )
+                """
+            )
+
+    def _load_daily_obs(self) -> None:
+        """Load persisted daily max/min values from SQLite."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT station_id, date, daily_max_f, daily_min_f FROM metar_daily_obs"
+            ).fetchall()
+        for station_id, obs_date, daily_max, daily_min in rows:
+            self._daily_max.setdefault(station_id, {})[obs_date] = float(daily_max)
+            self._daily_min.setdefault(station_id, {})[obs_date] = float(daily_min)
+
+    def _save_daily_obs(
+        self,
+        station_id: str,
+        obs_date: str,
+        daily_max: float,
+        daily_min: float,
+    ) -> None:
+        """Persist daily max/min after each observation update."""
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO metar_daily_obs (station_id, date, daily_max_f, daily_min_f)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(station_id, date) DO UPDATE SET
+                    daily_max_f = excluded.daily_max_f,
+                    daily_min_f = excluded.daily_min_f
+                """,
+                (station_id, obs_date, daily_max, daily_min),
+            )
+
+    def _local_date(self, station_id: str) -> str:
+        """Return today's date in the station's local timezone."""
+        tz_name = self.STATION_TIMEZONES.get(station_id, "America/New_York")
+        tz = zoneinfo.ZoneInfo(tz_name)
+        return datetime.now(tz).date().isoformat()
+
+    def _hours_of_cooling_remaining(self, station_id: str) -> float:
+        """Estimate hours until overnight low formation completes."""
+        local_hour = self._get_local_hour(station_id)
+        if local_hour >= 18:
+            return float(max(0, 24 - local_hour + 6))
+        if local_hour <= 6:
+            return float(max(0, 6 - local_hour))
+        return 0.0
 
     def _is_peak_heating_hour(self, station_id: str) -> bool:
         """Return True if current local time is in peak heating window (10am-4pm)."""

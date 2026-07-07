@@ -554,11 +554,13 @@ class BotLauncher:
                 await ctx.send(f"❌ Could not fetch METAR for {station}")
                 return
             daily_max = obs.get("daily_max_f", obs["temp_f"])
+            daily_min = obs.get("daily_min_f", obs["temp_f"])
             trend = tracker.get_temperature_trend(station) or "insufficient data"
             await ctx.send(
                 f"🌡️ **{station} Live METAR**\n"
                 f"Current temp: **{obs['temp_f']:.1f}°F**\n"
                 f"Today's max so far: **{daily_max:.1f}°F**\n"
+                f"Today's min so far: **{daily_min:.1f}°F**\n"
                 f"Trend: {trend}\n"
                 f"Wind: {obs.get('wind_speed_kt', 'N/A')}kt @ {obs.get('wind_dir', 'N/A')}°\n"
                 f"Sky: {obs.get('sky_cover', 'N/A')}\n"

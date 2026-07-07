@@ -90,7 +90,7 @@ class Trader:
         self.pnl_path = DATA_DIR / "pnl.json"
         self.kalshi = KalshiClient()
         self.weather = WeatherClient()
-        self.metar = MetarTracker()
+        self.metar = MetarTracker(DATA_DIR / "metar_obs.db")
         self.edge_engine = EdgeEngine()
         self.claude = ClaudeChecker()
         self.position_sizer = PositionSizer()
@@ -345,13 +345,23 @@ class Trader:
         threshold = self.edge_engine.parse_threshold(market)
         hours_until = self.edge_engine.hours_until_settlement(settlement_time)
         strike_type = self.edge_engine.strike_type(market)
+        metar_threshold = threshold or 0.0
+        upper_threshold: float | None = None
+        if strike_type == "between":
+            floor = market.raw.get("floor_strike")
+            cap = market.raw.get("cap_strike")
+            if floor is not None:
+                metar_threshold = float(floor)
+            if cap is not None:
+                upper_threshold = float(cap)
         metar_assessment = self.metar.assess_market_vs_observation(
             settlement_station,
-            threshold_f=threshold or 0.0,
+            threshold_f=metar_threshold,
             side="yes",
             strike_type=strike_type,
             market_type=market_type.upper(),
             hours_until_settlement=hours_until or 24.0,
+            upper_threshold_f=upper_threshold,
         )
         edge = self.edge_engine.evaluate(
             market,
@@ -498,6 +508,7 @@ class Trader:
             "return_multiple": round((1.0 - price) / price, 2) if price > 0 else 0.0,
             "min_required_profit": round(stake, 2),
             "observed_daily_max_f": metar.get("observed_max_f"),
+            "observed_daily_min_f": metar.get("observed_min_f"),
             "current_station_temp_f": metar.get("current_temp_f"),
             "metar_resolved_direction": metar.get("resolved_direction"),
             "metar_confidence": metar.get("confidence"),
