@@ -17,7 +17,7 @@ import requests
 
 from src.bot_control import is_paused
 from src.claude_checker import ClaudeChecker, ClaudeDecision
-from src.edge_engine import EdgeDecision, EdgeEngine
+from src.edge_engine import EdgeDecision, EdgeEngine, estimate_probability
 from src.kalshi_client import KalshiClient, KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
 from src.risk_manager import RiskManager
@@ -896,6 +896,161 @@ class Trader:
             f"Budget remaining: ${budget_remaining:.2f}",
             mention=True,
         )
+
+    def audit_positions(self) -> list[dict[str, Any]]:
+        """Audit open positions and recommend HOLD or SELL for each."""
+        results: list[dict[str, Any]] = []
+        positions = self.risk.get_open_live_positions()
+
+        for pos in positions:
+            ticker = pos["ticker"]
+            side = str(pos["side"]).lower()
+            contracts = int(pos["contracts"])
+            original_cost = float(pos["stake"])
+            avg_price = original_cost / contracts if contracts > 0 else 0.0
+            del avg_price
+
+            try:
+                market_data = self.kalshi._get(f"/markets/{ticker}")
+                m = market_data.get("market", {})
+                status = str(m.get("status", "")).lower()
+                rules_primary = str(m.get("rules_primary", ""))
+
+                if status in ("finalized", "settled"):
+                    results.append({
+                        "ticker": ticker,
+                        "recommendation": "ALREADY_SETTLED",
+                        "reason": f"Market already {status}",
+                        "auto_sell": False,
+                    })
+                    continue
+
+                yes_bid = self.kalshi._price_to_float(m.get("yes_bid_dollars")) or self.kalshi._extract_price(m, "yes_bid") or 0.0
+                yes_ask = self.kalshi._price_to_float(m.get("yes_ask_dollars")) or self.kalshi._extract_price(m, "yes_ask") or 0.0
+                no_bid = 1.0 - yes_ask if yes_ask > 0 else 0.0
+                no_ask = 1.0 - yes_bid if yes_bid > 0 else 0.0
+
+                if side == "no":
+                    current_price = no_bid
+                    current_value = current_price * contracts
+                else:
+                    current_price = yes_bid
+                    current_value = current_price * contracts
+
+                unrealized_pnl = current_value - original_cost
+                unrealized_pct = (unrealized_pnl / original_cost * 100) if original_cost > 0 else 0.0
+
+                self.kalshi.get_orderbook(ticker)
+                has_liquidity = current_price > 0.02
+
+                settlement_station = self.weather.parse_settlement_station(rules_primary)
+                hours_until = self.kalshi._hours_until_settlement(m)
+                target_date = self.kalshi._target_date_from_ticker(ticker)
+                market_type = "high" if "HIGH" in ticker.upper() else "low"
+                strike_type = str(m.get("strike_type", "greater"))
+                threshold = float(m.get("floor_strike") or m.get("cap_strike") or 0)
+
+                forecast_temp: float | None = None
+                current_edge: float | None = None
+                edge_flipped = False
+
+                series_prefix = ticker.split("-", 1)[0]
+                city = self.weather.city_for_market(series_prefix, ticker)
+                if settlement_station and target_date and city is not None:
+                    forecast = self.weather.get_station_forecast(
+                        settlement_station,
+                        target_date,
+                        market_type,
+                        city=city,
+                    )
+                    if forecast.temperature_f is not None:
+                        forecast_temp = forecast.temperature_f
+                        yes_prob = estimate_probability(
+                            forecast_temp,
+                            threshold,
+                            market_type,
+                            strike_type=strike_type,
+                            station_id=settlement_station,
+                            target_date=target_date,
+                            hours_until_settlement=hours_until,
+                        )
+                        model_prob = yes_prob if side == "yes" else (1.0 - yes_prob)
+                        market_price = yes_ask if side == "yes" else no_ask
+                        current_edge = model_prob - market_price
+                        edge_flipped = current_edge < 0
+
+                recommendation = "HOLD"
+                reason = ""
+                urgency = "LOW"
+
+                if edge_flipped:
+                    recommendation = "SELL"
+                    reason = (
+                        f"Edge FLIPPED — model now says {side.upper()} is wrong side "
+                        f"(edge={current_edge:.2f})"
+                    )
+                    urgency = "HIGH"
+                elif hours_until < 2 and unrealized_pct < -30:
+                    recommendation = "SELL"
+                    reason = (
+                        f"Settling in {hours_until:.1f}h and down {unrealized_pct:.0f}% — cut losses"
+                    )
+                    urgency = "HIGH"
+                elif unrealized_pct < -70 and hours_until > 6:
+                    recommendation = "SELL"
+                    reason = (
+                        f"Down {unrealized_pct:.0f}% with {hours_until:.1f}h left — recover some value"
+                    )
+                    urgency = "MEDIUM"
+                elif current_price > 0 and (1.0 - current_price) / current_price < 0.5:
+                    recommendation = "SELL"
+                    return_multiple = (1.0 - current_price) / current_price
+                    reason = (
+                        f"Return multiple fallen to {return_multiple:.2f}x — no longer profitable"
+                    )
+                    urgency = "MEDIUM"
+                elif current_edge is not None and current_edge > 0.05:
+                    recommendation = "HOLD"
+                    reason = (
+                        f"Edge still positive ({current_edge:.2f}), forecast {forecast_temp:.1f}°F, "
+                        f"{hours_until:.1f}h to settle"
+                    )
+                else:
+                    recommendation = "HOLD"
+                    reason = (
+                        f"No strong sell signal, {hours_until:.1f}h to settlement, "
+                        f"P&L {unrealized_pct:+.0f}%"
+                    )
+
+                results.append({
+                    "ticker": ticker,
+                    "side": side,
+                    "contracts": contracts,
+                    "original_cost": original_cost,
+                    "current_value": round(current_value, 2),
+                    "unrealized_pnl": round(unrealized_pnl, 2),
+                    "unrealized_pct": round(unrealized_pct, 1),
+                    "current_price": current_price,
+                    "has_liquidity": has_liquidity,
+                    "forecast_temp": forecast_temp,
+                    "current_edge": current_edge,
+                    "hours_until": hours_until,
+                    "recommendation": recommendation,
+                    "reason": reason,
+                    "urgency": urgency,
+                    "auto_sell": recommendation == "SELL" and has_liquidity and urgency == "HIGH",
+                })
+
+            except Exception as exc:
+                logging.warning("Audit failed for %s: %s", ticker, exc)
+                results.append({
+                    "ticker": ticker,
+                    "recommendation": "ERROR",
+                    "reason": str(exc),
+                    "auto_sell": False,
+                })
+
+        return results
 
     def check_settlements(self) -> None:
         """Check open positions for settlement. Only book P&L when finalized."""

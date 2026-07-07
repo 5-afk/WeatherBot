@@ -373,6 +373,170 @@ class BotLauncher:
             body = "\n".join(lines)
             await ctx.send(f"✅ Synced {synced} position(s):\n```\n{body}\n```")
 
+        @self.bot.command(name="auditpositions")
+        async def auditpositions_cmd(ctx):
+            """Audit open positions, recommend HOLD/SELL, auto-sell where possible."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            await ctx.send("🔍 Auditing open positions...")
+
+            try:
+                launcher._sync_positions_from_kalshi()
+            except Exception as exc:
+                await ctx.send(f"⚠️ Position sync failed: {exc}")
+                return
+
+            from src.trader import Trader
+
+            try:
+                trader = Trader()
+                audit_results = trader.audit_positions()
+            except Exception as exc:
+                await ctx.send(f"⚠️ Audit failed: {exc}")
+                return
+
+            if not audit_results:
+                await ctx.send("📊 No open positions to audit.")
+                return
+
+            for result in audit_results:
+                ticker = result["ticker"]
+                rec = result["recommendation"]
+                reason = result["reason"]
+
+                if rec in {"ALREADY_SETTLED", "ERROR"}:
+                    emoji = "ℹ️" if rec == "ALREADY_SETTLED" else "❌"
+                    await ctx.send(f"{emoji} **{ticker}** — **{rec}**: {reason}")
+                    continue
+
+                urgency = result.get("urgency", "LOW")
+                has_liquidity = result.get("has_liquidity", False)
+                pnl = result.get("unrealized_pnl", 0)
+                pnl_pct = result.get("unrealized_pct", 0)
+                contracts = result.get("contracts", 0)
+                side = result.get("side", "")
+                current_price = result.get("current_price", 0)
+                hours = result.get("hours_until", 0)
+
+                emoji = "✅" if rec == "HOLD" else "⚠️" if urgency == "MEDIUM" else "🚨"
+
+                if result.get("auto_sell"):
+                    sell_result = trader.kalshi.sell_position(ticker, side, contracts)
+                    if sell_result["filled"]:
+                        filled = sell_result["contracts_filled"]
+                        price = sell_result["price"]
+                        proceeds = filled * price
+                        await ctx.send(
+                            f"🚨 **AUTO-SOLD** {ticker}\n"
+                            f"Sold {filled} {side.upper()} contracts @ ${price:.2f}\n"
+                            f"Proceeds: ${proceeds:.2f}\n"
+                            f"Reason: {reason}"
+                        )
+                        continue
+                    result["has_liquidity"] = False
+                    has_liquidity = False
+
+                forecast_temp = result.get("forecast_temp")
+                forecast_str = f"{forecast_temp:.1f}" if forecast_temp is not None else "N/A"
+                current_edge = result.get("current_edge")
+                edge_str = f"{current_edge:.2f}" if current_edge is not None else "N/A"
+
+                msg = (
+                    f"{emoji} **{ticker}**\n"
+                    f"Side: {side.upper()} | Contracts: {contracts} | "
+                    f"Current price: ${current_price:.2f}\n"
+                    f"P&L: ${pnl:+.2f} ({pnl_pct:+.0f}%) | "
+                    f"Settlement: {hours:.1f}h\n"
+                    f"Forecast: {forecast_str}°F | Edge: {edge_str}\n"
+                    f"**{rec}** — {reason}\n"
+                )
+
+                if rec == "SELL" and not has_liquidity:
+                    msg += (
+                        "\n⚠️ **LOW LIQUIDITY — Manual sell required:**\n"
+                        "```\n"
+                        f"Go to: kalshi.com/markets/{ticker}\n"
+                        "Click: SELL tab\n"
+                        f"Shares: {contracts}\n"
+                        "Order type: LIMIT\n"
+                        "Expiration: EOD (End of Day)\n"
+                        f"Limit price: ${max(0.01, current_price - 0.02):.2f} "
+                        "(or lower to 1¢ for immediate fill)\n"
+                        "Submit as resting order: YES (wait for buyer)\n"
+                        "```"
+                    )
+                elif rec == "SELL" and has_liquidity:
+                    msg += f"\n💡 **Liquid — use `!sellposition {ticker}` to sell now**"
+
+                await ctx.send(msg)
+
+            sells = [r for r in audit_results if r["recommendation"] == "SELL"]
+            holds = [r for r in audit_results if r["recommendation"] == "HOLD"]
+            await ctx.send(
+                f"📊 **Audit complete:** {len(holds)} HOLD, {len(sells)} SELL recommended\n"
+                "Run `!auditpositions` again after manual sells to re-evaluate."
+            )
+
+        @self.bot.command(name="sellposition")
+        async def sellposition_cmd(ctx, ticker: str | None = None):
+            """Manually sell all contracts of a specific open position."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            if not ticker:
+                await ctx.send("Usage: `!sellposition KXHIGHMIA-26JUL06-B91.5`")
+                return
+
+            positions = launcher._get_open_positions()
+            pos = next((p for p in positions if p["ticker"] == ticker), None)
+            if pos is None:
+                pos = next((p for p in positions if p["ticker"].upper() == ticker.upper()), None)
+
+            if not pos:
+                await ctx.send(f"❌ No open position found for {ticker}")
+                return
+
+            side = str(pos["side"]).lower()
+            contracts = int(pos["contracts"])
+            await ctx.send(
+                f"⏳ Attempting to sell {contracts} {side.upper()} contracts on {pos['ticker']}..."
+            )
+
+            from src.kalshi_client import KalshiClient
+
+            k = KalshiClient()
+            result = k.sell_position(pos["ticker"], side, contracts)
+
+            if result["filled"]:
+                proceeds = result["contracts_filled"] * result["price"]
+                await ctx.send(
+                    f"✅ **Sold** {result['contracts_filled']} contracts @ ${result['price']:.2f}\n"
+                    f"Proceeds: **${proceeds:.2f}**\n"
+                    "Run `!resetstate` to sync your balance."
+                )
+            else:
+                market = k._get(f"/markets/{pos['ticker']}").get("market", {})
+                if side == "no":
+                    yes_bid = k._price_to_float(market.get("yes_bid_dollars")) or k._extract_price(market, "yes_bid") or 0.0
+                    sell_price = yes_bid
+                else:
+                    no_bid = k._price_to_float(market.get("no_bid_dollars")) or k._extract_price(market, "no_bid") or 0.0
+                    sell_price = 1.0 - no_bid
+
+                await ctx.send(
+                    "⚠️ **No immediate fill — Low liquidity**\n"
+                    "Manual sell required on Kalshi.com:\n"
+                    "```\n"
+                    f"Market: {pos['ticker']}\n"
+                    "Tab: SELL\n"
+                    f"Shares: {contracts}\n"
+                    "Order type: LIMIT\n"
+                    "Expiration: EOD\n"
+                    f"Limit price: ${max(0.01, sell_price):.2f}\n"
+                    "Submit as resting order: YES\n"
+                    "```\n"
+                    "Lower limit price to 1¢ if you want immediate fill at any price."
+                )
+
         @self.bot.command(name="ps")
         async def ps_cmd(ctx):
             """Show discord_launcher processes for remote diagnostics."""
@@ -441,6 +605,8 @@ class BotLauncher:
                 "!balance — show real Kalshi account balance\n"
                 "!positions — show open positions with live P&L\n"
                 "!syncpositions — sync open Kalshi positions into local DB\n"
+                "!auditpositions — audit all open positions, auto-sell if needed\n"
+                "!sellposition <ticker> — manually sell a specific open position\n"
                 "!resetstate — sync cash balance and close settled positions\n"
                 "!clearhalt — clear permanent halt and reset drawdown to current balance\n"
                 "!logs    — show last 30 log lines\n"
@@ -490,7 +656,8 @@ class BotLauncher:
 
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
-            "status", "balance", "positions", "syncpositions", "resetstate", "clearhalt", "logs", "logsfull",
+            "status", "balance", "positions", "syncpositions", "auditpositions", "sellposition",
+            "resetstate", "clearhalt", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }
         registered = {command.name for command in self.bot.commands}
@@ -828,6 +995,12 @@ class BotLauncher:
                 synced += 1
                 lines.append(f"{ticker} {side.upper()} {contracts} @ ${price:.2f} (${stake:.2f})")
         return synced, lines
+
+    def _get_open_positions(self) -> list[dict]:
+        """Read open live positions from SQLite."""
+        from src.risk_manager import RiskManager
+
+        return RiskManager(PROJECT_ROOT / "data" / "positions.db").get_open_live_positions()
 
     def _db_status(self):
         """Read budget and P&L status directly from SQLite."""

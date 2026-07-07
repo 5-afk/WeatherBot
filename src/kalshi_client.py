@@ -12,7 +12,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import requests
@@ -185,6 +185,75 @@ class KalshiClient:
                     exc.response.text,
                 )
             raise
+
+    def sell_position(
+        self,
+        ticker: str,
+        side: str,
+        contracts: int,
+        limit_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Exit an open position by placing the opposite V2 order on the YES leg.
+
+        Selling a NO position submits side=ask (sell YES) at the current yes_bid.
+        Selling a YES position submits side=bid (buy NO) at (1 - no_bid) on the YES leg.
+        """
+        side = side.lower()
+        if side not in {"yes", "no"}:
+            raise ValueError("side must be 'yes' or 'no'")
+        if contracts < 1:
+            raise ValueError("contracts must be at least 1")
+
+        market = self._get(f"/markets/{ticker}")
+        m = market.get("market", {})
+
+        if side == "no":
+            yes_bid = self._price_to_float(m.get("yes_bid_dollars")) or self._extract_price(m, "yes_bid") or 0.0
+            order_side = "ask"
+            price = limit_price if limit_price is not None else yes_bid
+            liquidity_warning = yes_bid < 0.02
+        else:
+            no_bid = self._price_to_float(m.get("no_bid_dollars")) or self._extract_price(m, "no_bid") or 0.0
+            order_side = "bid"
+            price = limit_price if limit_price is not None else (1.0 - no_bid)
+            liquidity_warning = no_bid < 0.02
+
+        if price < 0.01:
+            price = 0.01
+
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "client_order_id": str(uuid.uuid4()),
+            "side": order_side,
+            "count": f"{contracts:.2f}",
+            "price": f"{price:.4f}",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+        }
+
+        logging.warning("SELL ORDER: %s", json.dumps(body, indent=2))
+
+        try:
+            result = self._request("POST", self.ORDERS_PATH, json=body, auth_required=True)
+            order_id = str(result.get("order_id", ""))
+            filled = int(float(result.get("fill_count_fp", result.get("filled_count", 0)) or 0))
+            return {
+                "filled": filled > 0,
+                "contracts_filled": filled,
+                "price": price,
+                "order_id": order_id,
+                "liquidity_warning": liquidity_warning,
+            }
+        except Exception as exc:
+            logging.warning("SELL ORDER FAILED: %s", exc)
+            return {
+                "filled": False,
+                "contracts_filled": 0,
+                "price": price,
+                "order_id": "",
+                "liquidity_warning": True,
+                "error": str(exc),
+            }
 
     def test_connection(self) -> bool:
         """Return True when Kalshi reports the exchange is active."""
@@ -376,6 +445,39 @@ class KalshiClient:
     def has_credentials(self) -> bool:
         """Return True when both Kalshi key and secret are configured."""
         return bool(self.api_key and self.api_secret)
+
+    def _get(self, path: str, *, auth_required: bool = False) -> dict[str, Any]:
+        """Fetch a Kalshi GET endpoint and return parsed JSON."""
+        return self._request("GET", path, auth_required=auth_required)
+
+    @staticmethod
+    def _price_to_float(value: Any) -> float | None:
+        """Convert a Kalshi dollar-string price to float dollars."""
+        return KalshiClient._price_to_dollars(value)
+
+    @staticmethod
+    def _target_date_from_ticker(ticker: str) -> date | None:
+        """Parse settlement date from tickers like KXHIGHMIA-26JUL06-B91.5."""
+        import re
+
+        match = re.search(r"-(\d{2})([A-Z]{3})(\d{2})-", ticker.upper())
+        if not match:
+            return None
+        yy, mon, dd = match.groups()
+        try:
+            return datetime.strptime(f"{yy}{mon}{dd}", "%y%b%d").date()
+        except ValueError:
+            return None
+
+    def _hours_until_settlement(self, market: dict[str, Any]) -> float:
+        """Return hours until settlement from raw market metadata."""
+        settlement_time = self._parse_time(
+            market.get("settlement_time") or market.get("expected_expiration_time")
+        )
+        if settlement_time is None:
+            return 24.0
+        delta = settlement_time.astimezone(timezone.utc) - datetime.now(timezone.utc)
+        return max(0.0, round(delta.total_seconds() / 3600, 2))
 
     def _request(
         self,
