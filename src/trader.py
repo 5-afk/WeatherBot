@@ -16,7 +16,7 @@ import colorlog
 import requests
 
 from src.bot_control import is_paused
-from src.claude_checker import ClaudeChecker, ClaudeDecision
+from src.contract_validator import ContractValidator, VALIDATION_CHECK_COUNT
 from src.edge_engine import EdgeDecision, EdgeEngine, estimate_probability
 from src.metar_tracker import MetarTracker
 from src.kalshi_client import KalshiClient, KalshiMarket
@@ -91,6 +91,7 @@ class Trader:
         self.kalshi = KalshiClient()
         self.weather = WeatherClient()
         self.metar = MetarTracker(DATA_DIR / "metar_obs.db")
+        self.validator = ContractValidator()
         self.edge_engine = EdgeEngine()
         self.claude = ClaudeChecker()
         self.position_sizer = PositionSizer()
@@ -151,6 +152,8 @@ class Trader:
         self._scan_bets = 0
         self._scan_skips = 0
         self._scan_signals = 0
+        self._validation_passed = 0
+        self._validation_failed = 0
         self._weather_cache: dict[tuple[str, str, str], NwsForecast] = {}
         self._observation_cache: dict[str, float | None] = {}
 
@@ -215,11 +218,12 @@ class Trader:
             )
 
         logging.info(
-            "[CYCLE] Checked %d markets, %d candidates (%d cities x ~%d markets each)",
+            "[CYCLE] Checked %d markets | %d passed validation | "
+            "%d failed validation | %d candidates",
             total_checked,
+            self._validation_passed,
+            self._validation_failed,
             len(candidates),
-            city_count,
-            total_checked // city_count if city_count else 0,
         )
         if not candidates:
             logging.info("[CYCLE] No qualifying candidates — scan complete")
@@ -300,15 +304,56 @@ class Trader:
             self._log_skip(city, market, "No settlement time available.", None)
             return None
 
-        market_type = self.edge_engine.market_type(market)
-        target_date = settlement_time.astimezone(timezone.utc).date()
-
         rules_primary = self._rules_primary_for_market(market)
         settlement_station = self.weather.parse_settlement_station(rules_primary)
-        if not settlement_station:
-            logging.warning("[SKIP] %s — could not determine settlement station from rules", market.ticker)
-            self._log_skip(city, market, "Could not determine settlement station from rules.", None)
+
+        threshold = self.edge_engine.parse_threshold(market)
+        strike_type = self.edge_engine.strike_type(market)
+        upper_threshold: float | None = None
+        if strike_type == "between":
+            cap = market.raw.get("cap_strike")
+            if cap is not None:
+                try:
+                    upper_threshold = float(cap)
+                except (TypeError, ValueError):
+                    upper_threshold = None
+
+        market_dict = dict(market.raw)
+        if rules_primary and not market_dict.get("rules_primary"):
+            market_dict["rules_primary"] = rules_primary
+
+        validation = self.validator.validate(
+            ticker=market.ticker,
+            market=market_dict,
+            parsed_station=settlement_station,
+            forecast_station=settlement_station,
+            threshold=threshold,
+            upper_threshold=upper_threshold,
+        )
+        if not validation.valid:
+            with self._scan_lock:
+                self._validation_failed += 1
+            logging.warning(
+                "[SKIP] %s — validation failed: %s",
+                market.ticker,
+                validation.reason,
+            )
+            self._log_skip(city, market, f"Validation failed: {validation.reason}", None)
             return None
+
+        with self._scan_lock:
+            self._validation_passed += 1
+
+        settlement_station = validation.confirmed_station or settlement_station
+        threshold = validation.confirmed_threshold
+        upper_threshold = validation.confirmed_upper_threshold
+        strike_type = validation.confirmed_strike_type or strike_type
+        market_type = (validation.confirmed_market_type or "HIGH").lower()
+        hours_until = validation.confirmed_hours_until_close
+        if hours_until is None:
+            hours_until = self.edge_engine.hours_until_settlement(settlement_time)
+
+        target_date = settlement_time.astimezone(timezone.utc).date()
 
         cache_key = (settlement_station, target_date.isoformat(), market_type)
         try:
@@ -342,23 +387,12 @@ class Trader:
 
         current_temp_f = self._current_temp_f(settlement_station)
         imbalance_score = self._fetch_imbalance(market)
-        threshold = self.edge_engine.parse_threshold(market)
-        hours_until = self.edge_engine.hours_until_settlement(settlement_time)
-        strike_type = self.edge_engine.strike_type(market)
         metar_threshold = threshold or 0.0
-        upper_threshold: float | None = None
-        if strike_type == "between":
-            floor = market.raw.get("floor_strike")
-            cap = market.raw.get("cap_strike")
-            if floor is not None:
-                metar_threshold = float(floor)
-            if cap is not None:
-                upper_threshold = float(cap)
         metar_assessment = self.metar.assess_market_vs_observation(
             settlement_station,
             threshold_f=metar_threshold,
             side="yes",
-            strike_type=strike_type,
+            strike_type=strike_type or "greater",
             market_type=market_type.upper(),
             hours_until_settlement=hours_until or 24.0,
             upper_threshold_f=upper_threshold,
@@ -372,6 +406,7 @@ class Trader:
             ladder_multiplier=ladder_multiplier,
             imbalance_score=imbalance_score,
             metar_assessment=metar_assessment,
+            validation_result=validation,
         )
         if not edge.should_trade:
             if edge.reason.startswith("Pre-Claude gate failed"):
@@ -480,7 +515,8 @@ class Trader:
         stake = sized.stake
         profit_if_wins = sized.profit_if_wins
         metar = edge.metar_assessment or {}
-        return {
+        validation = edge.validation_result
+        payload = {
             "ticker": market.ticker,
             "city": city.name,
             "side": edge.side,
@@ -516,6 +552,15 @@ class Trader:
             "temperature_trend": metar.get("trend"),
             "hours_of_heating_remaining": metar.get("hours_of_heating_remaining"),
         }
+        if validation is not None and getattr(validation, "valid", False):
+            payload.update({
+                "validation_checks_passed": VALIDATION_CHECK_COUNT,
+                "confirmed_station": getattr(validation, "confirmed_station", None),
+                "confirmed_strike_type": getattr(validation, "confirmed_strike_type", None),
+                "confirmed_threshold": getattr(validation, "confirmed_threshold", None),
+                "settlement_source": getattr(validation, "confirmed_settlement_source", None),
+            })
+        return payload
 
     def _select_candidate(
         self,

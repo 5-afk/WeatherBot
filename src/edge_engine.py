@@ -90,6 +90,7 @@ class EdgeDecision:
     ev: float | None = None
     imbalance_score: float = 0.5
     metar_assessment: dict | None = None
+    validation_result: object | None = None
 
 
 class EdgeEngine:
@@ -141,12 +142,33 @@ class EdgeEngine:
         ladder_multiplier: float = 1.0,
         imbalance_score: float = 0.5,
         metar_assessment: dict | None = None,
+        validation_result: object | None = None,
     ) -> EdgeDecision:
         """Return a complete GO/skip decision before Claude and risk checks."""
-        market_type = self.market_type(market)
-        threshold = self.parse_threshold(market)
+        if validation_result is not None and getattr(validation_result, "valid", False):
+            market_type = str(getattr(validation_result, "confirmed_market_type", "HIGH")).lower()
+            threshold = getattr(validation_result, "confirmed_threshold", None)
+            strike_type = str(getattr(validation_result, "confirmed_strike_type", "") or self.strike_type(market))
+            lower_threshold = threshold
+            upper_threshold = getattr(validation_result, "confirmed_upper_threshold", None)
+        else:
+            market_type = self.market_type(market)
+            threshold = self.parse_threshold(market)
+            strike_type = self.strike_type(market)
+            lower_threshold = threshold
+            upper_threshold: float | None = None
+            if strike_type == "between":
+                floor = self._safe_float(market.raw.get("floor_strike"))
+                cap = self._safe_float(market.raw.get("cap_strike"))
+                if floor is not None:
+                    lower_threshold = floor
+                if cap is not None:
+                    upper_threshold = cap
+
         settlement_time = market.settlement_time or market.close_time
         hours_until_settlement = self.hours_until_settlement(settlement_time)
+        if validation_result is not None and getattr(validation_result, "confirmed_hours_until_close", None):
+            hours_until_settlement = getattr(validation_result, "confirmed_hours_until_close")
 
         if threshold is None:
             return self._skip("Could not parse one temperature threshold.", market_type, None, hours_until_settlement)
@@ -162,14 +184,8 @@ class EdgeEngine:
         if nws_temp is None:
             return self._skip("NWS station forecast unavailable.", market_type, threshold, hours_until_settlement)
 
-        strike_type = self.strike_type(market)
-        lower_threshold = threshold
-        upper_threshold: float | None = None
-        if strike_type == "between":
-            floor = self._safe_float(market.raw.get("floor_strike"))
+        if strike_type == "between" and upper_threshold is None:
             cap = self._safe_float(market.raw.get("cap_strike"))
-            if floor is not None:
-                lower_threshold = floor
             if cap is not None:
                 upper_threshold = cap
             logging.debug(
@@ -220,14 +236,14 @@ class EdgeEngine:
         passing = [d for d in (yes_decision, no_decision) if d.should_trade]
         if passing:
             chosen = max(passing, key=lambda d: (0 if d.side == "no" else 1, -(d.ev or 0.0)))
-            return replace(chosen, metar_assessment=metar_assessment)
+            return replace(chosen, metar_assessment=metar_assessment, validation_result=validation_result)
 
         yes_wrong_side = (
             not yes_decision.should_trade
             and "wrong side of threshold" in yes_decision.reason.lower()
         )
         if yes_wrong_side and no_decision.should_trade:
-            return replace(no_decision, metar_assessment=metar_assessment)
+            return replace(no_decision, metar_assessment=metar_assessment, validation_result=validation_result)
         if yes_wrong_side and no_decision.ev is not None and no_decision.buffer_score > 0:
             logging.debug(
                 "YES buffer failed for %s — NO side ev=%.4f buffer=%.2f reason=%s",
@@ -240,9 +256,9 @@ class EdgeEngine:
         candidates = [yes_decision, no_decision]
         if yes_wrong_side:
             chosen = max(candidates, key=lambda d: (0 if d.side == "no" else 1, d.ev if d.ev is not None else -999.0))
-            return replace(chosen, metar_assessment=metar_assessment)
+            return replace(chosen, metar_assessment=metar_assessment, validation_result=validation_result)
         chosen = max(candidates, key=lambda d: d.ev if d.ev is not None else -999.0)
-        return replace(chosen, metar_assessment=metar_assessment)
+        return replace(chosen, metar_assessment=metar_assessment, validation_result=validation_result)
 
     @staticmethod
     def _blend_metar_probability(

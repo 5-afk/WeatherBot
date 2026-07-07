@@ -99,6 +99,16 @@ class ClaudeChecker:
         "metar_resolved_direction tells you what the current observations imply. "
         "temperature_trend tells you if temperature is still rising, falling, or stable. "
         "Always weight real observed data more heavily than forecast models. "
+        "VALIDATION LAYER: "
+        "Every candidate has passed 10 contract validation checks before reaching you: "
+        "Market is still active and open for trading; settles on NWS data (confirmed in rules text); "
+        "Settlement station matches forecast station; threshold matches API floor_strike/cap_strike; "
+        "Strike type confirmed against rules text; market type confirmed against ticker prefix; "
+        "probability formula matches strike type; city name confirmed in rules text. "
+        "The confirmed_threshold, confirmed_station, and confirmed_strike_type fields "
+        "are the authoritative values — use these, not the raw ticker parsing. "
+        "If any of these look wrong to you based on rules_primary, return NOGO "
+        "with reason \"Validation concern: [what looks wrong]\". "
         + CALIBRATION_NOTES
     )
 
@@ -226,6 +236,16 @@ class ClaudeChecker:
                     "metar_resolved_direction tells you what the current observations imply. "
                     "temperature_trend tells you if temperature is still rising, falling, or stable. "
                     "Always weight real observed data more heavily than forecast models. "
+                    "VALIDATION LAYER: "
+                    "Every candidate has passed 10 contract validation checks before reaching you: "
+                    "Market is still active and open for trading; settles on NWS data (confirmed in rules text); "
+                    "Settlement station matches forecast station; threshold matches API floor_strike/cap_strike; "
+                    "Strike type confirmed against rules text; market type confirmed against ticker prefix; "
+                    "probability formula matches strike type; city name confirmed in rules text. "
+                    "The confirmed_threshold, confirmed_station, and confirmed_strike_type fields "
+                    "are the authoritative values — use these, not the raw ticker parsing. "
+                    "If any of these look wrong to you based on rules_primary, return NOGO "
+                    "with reason \"Validation concern: [what looks wrong]\". "
                     + ClaudeChecker.CALIBRATION_NOTES
                 ),
                 messages=[{
