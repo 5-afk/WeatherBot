@@ -16,6 +16,7 @@ import colorlog
 import requests
 
 from src.bot_control import is_paused
+from src.claude_checker import ClaudeChecker, ClaudeDecision
 from src.contract_validator import ContractValidator, VALIDATION_CHECK_COUNT
 from src.edge_engine import EdgeDecision, EdgeEngine, estimate_probability
 from src.metar_tracker import MetarTracker
