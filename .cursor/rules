@@ -1,0 +1,157 @@
+# WhetherBot / ATLAS Project Rules
+# These rules apply to ALL files in this project. Never violate them.
+
+## IDENTITY & CONTEXT
+This is a live Kalshi prediction market trading bot called WhetherBot running on:
+- Dev machine: Windows C:\Users\Crazy\OneDrive\Desktop\TradingBot\kalshi-weather-bot
+- Production machine: Linux Mint ThinkPad at /home/astro/WeatherBot
+- Files cannot be transferred directly between machines
+- GitHub (https://github.com/5-afk/WeatherBot.git) and Discord are the ONLY reliable communication channels between machines
+- The bot trades real money on a live Kalshi account — treat every code change as production-critical
+
+## NEVER DO THESE THINGS
+- Never use bare `python` or `python3` in subprocess calls — always use PROJECT_ROOT / "venv" / "bin" / "python"
+- Never hardcode city-to-station mappings — always parse settlement station from contract rules_primary text
+- Never assume a market is settled based on price ($0.01) or status="closed" — only settle on status="finalized" AND result field populated
+- Never place orders to /portfolio/orders — the correct V2 endpoint is /portfolio/events/orders
+- Never use status="active" as a query parameter to Kalshi markets list — use status="open"
+- Never run discord_commander.py — it is deprecated and conflicts with discord_launcher.py
+- Never create duplicate Discord bot instances — exactly ONE bot.run(token) call must exist in the entire codebase
+- Never use os.getcwd() for file paths — always use Path(__file__).resolve().parent
+- Never use localStorage or sessionStorage in any artifact or dashboard HTML
+- Never install packages without --break-system-packages on Linux (pip)
+- Never commit .env files — they are gitignored and must be manually maintained on the ThinkPad
+- Never use Open-Meteo API — it has been replaced entirely with NWS gridded station forecasts
+- Never use hardcoded sigma value of 3.5 — sigma is per-city and per-season from CITY_SIGMA dict
+- Never skip the contract validation layer (ContractValidator) before math evaluation
+- Never book P&L on status="determined" or status="closed" — only on "finalized"/"settled"
+- Never use time.sleep() inside get_ensemble_forecast() — sleeping belongs only in prewarm functions
+- Never use ThreadPoolExecutor without a threading.Lock around cache reads/writes in WeatherClient
+- Never suggest running Python scripts directly on the ThinkPad — use Discord commands or GitHub
+
+## ALWAYS DO THESE THINGS
+- Always read contract rules_primary before evaluating any market
+- Always parse settlement station from rules_primary text using parse_settlement_station()
+- Always use the correct binary Kelly formula: f* = (p - c) / (1 - c)
+- Always enforce the price band: MIN_TRADEABLE_PRICE=0.15, MAX_TRADEABLE_PRICE=0.47
+- Always enforce 2x minimum return: profit_if_wins >= stake
+- Always enforce minimum bet: MIN_BET_USD=10.0
+- Always enforce dynamic position limits: min(POSITION_COUNT_CEILING, floor(0.70 * balance / bet_size))
+- Always use IOC (immediate_or_cancel) for order time_in_force
+- Always use book_side "bid" for YES buys and "ask" for NO buys in V2 API
+- Always apply per-city seasonal sigma from CITY_SIGMA dict
+- Always apply per-city NWS bias corrections from CITY_BIAS_CORRECTIONS dict
+- Always apply intraday sigma collapse based on hours_until_settlement
+- Always run py_compile on all changed files before declaring any fix complete
+- Always commit with descriptive messages: "fix:", "feat:", "audit:", "debug:" prefixes
+- Always verify fixes with actual test assertions, not just "looks right"
+- Always read SKILL.md files before creating any document, presentation, or code file
+- Always use PROJECT_ROOT = Path(__file__).resolve().parent for all file paths
+- Always use load_dotenv(dotenv_path=PROJECT_ROOT / ".env") explicitly
+- Always log the settlement station being used for each market evaluation
+- Always check for existing open position on same ticker before placing new order
+- Always sync real Kalshi balance on bot startup when DRY_RUN=false
+- Always use model string "claude-haiku-4-5" for Claude batch calls in claude_checker.py
+- Always run calibration_log entry after confirmed fill
+- Always update calibration_log with actual outcome after settlement
+
+## KALSHI API RULES
+- Base URL: https://api.elections.kalshi.com/trade-api/v2
+- Auth: RSA-PSS signing, message = timestamp + METHOD.upper() + /trade-api/v2/path (no query params)
+- Orders endpoint: POST /portfolio/events/orders (NOT /portfolio/orders)
+- Cancel endpoint: DELETE /portfolio/events/orders/{order_id}
+- Order status: GET /portfolio/orders/{order_id}
+- Prices: dollar strings ("yes_ask_dollars": "0.3700") NOT integer cents
+- Market status field returns "active" for tradeable markets
+- Market list query uses status="open" as filter (different from field value)
+- Settlement: only finalized + result="yes"/"no" — never infer from price or closed status
+- Order format V2:
+  {ticker, client_order_id, side: "bid"|"ask", count: "166.00", price: "0.3100",
+   time_in_force: "immediate_or_cancel", self_trade_prevention_type: "taker_at_cross"}
+- YES buy: side="bid", price=yes_ask_dollars
+- NO buy: side="ask", price = 1 - no_ask (YES-leg equivalent)
+
+## CODEBASE STRUCTURE RULES
+- discord_launcher.py: the ONLY file that connects to Discord, the ONLY file with bot.run()
+- main.py: entry point only, outer restart loop, starts Trader + NWSWatcher
+- src/trader.py: full pipeline orchestrator, NO Discord logic
+- src/kalshi_client.py: ALL Kalshi API calls, NO business logic
+- src/edge_engine.py: ALL signal math, EV calc, price band, NO API calls
+- src/weather_client.py: NWS forecasts only, NO Kalshi calls, NO trading logic
+- src/metar_tracker.py: METAR real-time observations only
+- src/contract_validator.py: validation layer, runs before ANY math evaluation
+- src/calibration.py: calibration analytics, NO trading logic
+- src/risk_manager.py: SQLite state, position tracking, risk checks
+- src/position_sizer.py: Kelly sizing only, NO API calls
+- src/claude_checker.py: Claude API calls only, NO weather or Kalshi logic
+- src/discord_commander.py: DEPRECATED — do not add code here, do not instantiate
+- src/bot_control.py: cross-process trigger files only (scan.trigger, paused.flag)
+- data/positions.db: SQLite — single source of truth for all state
+- Never create new src/ files without explaining why existing files can't be extended
+
+## ENVIRONMENT & DEPLOYMENT RULES
+- ThinkPad venv: /home/astro/WeatherBot/venv/bin/python
+- ThinkPad project: /home/astro/WeatherBot
+- Windows project: C:\Users\Crazy\OneDrive\Desktop\TradingBot\kalshi-weather-bot
+- systemd service: kalshibot.service, managed via discord_launcher.py
+- After any code change: git add . && git commit && git push (Windows), then git pull (ThinkPad via Discord or terminal), then !restart
+- .env is gitignored — never commit it, never assume its values match .env.example
+- Log file: /home/astro/WeatherBot/logs/bot.log
+- Database: /home/astro/WeatherBot/data/positions.db
+- PID file: /home/astro/WeatherBot/bot.pid (single instance enforcement)
+
+## TRADING RULES (enforce in code)
+- Price band: $0.15 - $0.47 only (enforced in _check_price_band)
+- Min return: 2x (profit_if_wins >= stake, enforced in size_trade)
+- Min bet: $10 USD
+- Max bet: $75 USD
+- Max bankroll deployment: 70% at any time
+- Position ceiling: 6 (dynamic: min(6, floor(0.70*balance/bet_size)))
+- Kelly fraction: 0.15
+- Settlement window: 36 hours max
+- Min EV: 0.05
+- Min signal score: 0.75
+- Min liquidity: 20 contracts
+- NO side bias multiplier: 1.15x on signal score and EV
+- Never bet on contracts above $0.47 — violates 2x return rule
+- Never bet on contracts below $0.15 — fee drag destroys edge
+- Never place more than one bet per ticker per day
+
+## DASHBOARD / FLASK API RULES (new)
+- Flask API runs on port 5000 on the ThinkPad alongside the bot
+- All API endpoints return JSON with consistent shape: {success: bool, data: any, error: str|null}
+- Dashboard is a single HTML file at dashboard/index.html
+- Dashboard polls /api/status every 30s, /api/metar every 5min, /api/logs every 10s
+- Dark theme only — no light mode
+- Never expose API keys or .env values through the Flask API
+- Flask API is read-only for all GET endpoints — no state mutations via GET
+- All POST endpoints require a simple shared secret header (DASHBOARD_SECRET from .env)
+- Dashboard must work when bot is stopped — show "offline" state gracefully
+- Multi-agent support: each bot registers at /api/agents/register on startup
+
+## CALIBRATION LOOP RULES
+- Every confirmed fill must create a calibration_log entry immediately
+- Every settlement must update the calibration_log entry with actual outcome
+- MODEL_VERSION must be bumped in .env after any sigma, bias, or gate change
+- Never change more than ONE model parameter between calibration measurements
+- !calibration command must always show Brier score, CLV, and top city bias
+- !improvemodel must always recommend exactly ONE change, never multiple
+
+## CODE QUALITY RULES
+- All new methods must have a docstring explaining purpose, inputs, and outputs
+- All exception handlers must log the exception — never silent except: pass
+- All Discord commands must be registered with @self.bot.command decorator
+- All new config values must be added to both .env.example AND documented in the command that uses them
+- All file paths must use pathlib.Path, never string concatenation
+- All SQLite connections must use check_same_thread=False
+- All API calls must have try/except with appropriate fallback behavior
+- All new features must include at least one verification assertion
+
+## COMMUNICATION RULES
+- Colt drives all product decisions — implement what is asked, don't redesign without asking
+- Do not re-ask for information already established in the session
+- Do not request terminal output from the ThinkPad — use !logssince, !gitstatus, !ps instead
+- Do not suggest running Python scripts manually on the ThinkPad
+- When a fix is complete, show the specific verification output that proves it works
+- When something looks wrong, check it rather than defending the existing implementation
+- The most expensive mistake in this project was defending a wrong API endpoint — always verify suspicious behavior
