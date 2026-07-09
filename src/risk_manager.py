@@ -431,6 +431,149 @@ class RiskManager:
             return 0.0
         return max(0.0, (self.starting_balance - self.current_balance()) / self.starting_balance)
 
+    def log_prediction(
+        self,
+        *,
+        ticker: str,
+        city: str,
+        station_id: str,
+        market_type: str,
+        strike_type: str,
+        side: str,
+        threshold_f: float,
+        upper_threshold_f: float | None,
+        hours_until_settlement: float,
+        nws_forecast_f: float,
+        metar_observed_max_f: float | None,
+        model_probability: float,
+        market_price: float,
+        edge: float,
+        ev: float,
+        signal_score: float,
+        buffer_f: float,
+        sigma_used: float,
+        bias_correction_f: float,
+        contracts: int,
+        stake: float,
+        model_version: str = "v1.0",
+    ) -> int:
+        """Log a prediction at bet placement. Returns row id for settlement update."""
+        implied_prob = market_price if side == "yes" else (1.0 - market_price)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO calibration_log (
+                    ticker, city, station_id, market_type, strike_type, side,
+                    threshold_f, upper_threshold_f, bet_placed_at,
+                    hours_until_settlement, nws_forecast_f, metar_observed_max_f,
+                    model_probability, market_price, implied_probability,
+                    edge, ev, signal_score, buffer_f, sigma_used,
+                    bias_correction_f, contracts, stake, model_version
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    ticker,
+                    city,
+                    station_id,
+                    market_type,
+                    strike_type,
+                    side,
+                    threshold_f,
+                    upper_threshold_f,
+                    self._now(),
+                    hours_until_settlement,
+                    nws_forecast_f,
+                    metar_observed_max_f,
+                    model_probability,
+                    market_price,
+                    implied_prob,
+                    edge,
+                    ev,
+                    signal_score,
+                    buffer_f,
+                    sigma_used,
+                    bias_correction_f,
+                    contracts,
+                    stake,
+                    model_version,
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+
+    def settle_prediction(
+        self,
+        ticker: str,
+        actual_temp_f: float | None,
+        actual_outcome: str,
+        closing_price: float,
+        payout: float,
+    ) -> None:
+        """Update calibration log after settlement with actual outcome."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, side, market_price, nws_forecast_f, stake
+                FROM calibration_log WHERE ticker=? ORDER BY id DESC LIMIT 1
+                """,
+                (ticker,),
+            ).fetchone()
+            if not row:
+                return
+            row_id, side, entry_price, nws_forecast, stake = row
+            won = 1 if (
+                (str(side).lower() == "yes" and actual_outcome == "yes")
+                or (str(side).lower() == "no" and actual_outcome == "no")
+            ) else 0
+            forecast_error = (
+                round(actual_temp_f - float(nws_forecast), 1)
+                if actual_temp_f is not None and nws_forecast
+                else None
+            )
+            if str(side).lower() == "yes":
+                clv = closing_price - float(entry_price)
+            else:
+                clv = (1.0 - closing_price) - (1.0 - float(entry_price))
+            profit = float(payout) - float(stake) if won else -float(stake)
+            conn.execute(
+                """
+                UPDATE calibration_log SET
+                    actual_settlement_temp_f=?,
+                    actual_outcome=?,
+                    bet_won=?,
+                    forecast_error_f=?,
+                    closing_market_price=?,
+                    clv=?,
+                    payout=?,
+                    profit=?
+                WHERE id=?
+                """,
+                (
+                    actual_temp_f,
+                    actual_outcome,
+                    won,
+                    forecast_error,
+                    closing_price,
+                    clv,
+                    payout,
+                    profit,
+                    row_id,
+                ),
+            )
+
+    def get_calibration_data(self, min_trades: int = 1) -> list[dict[str, Any]]:
+        """Return all settled calibration log entries."""
+        del min_trades
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM calibration_log
+                WHERE actual_outcome IS NOT NULL
+                ORDER BY bet_placed_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def _init_db(self) -> None:
         """Create database tables if they do not already exist."""
         with self._connect() as conn:
@@ -495,6 +638,45 @@ class RiskManager:
                     reinvested REAL NOT NULL,
                     pocketed REAL NOT NULL,
                     running_budget REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS calibration_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    city TEXT,
+                    station_id TEXT,
+                    market_type TEXT,
+                    strike_type TEXT,
+                    side TEXT,
+                    threshold_f REAL,
+                    upper_threshold_f REAL,
+                    bet_placed_at TEXT,
+                    hours_until_settlement REAL,
+                    nws_forecast_f REAL,
+                    metar_observed_max_f REAL,
+                    model_probability REAL,
+                    market_price REAL,
+                    implied_probability REAL,
+                    edge REAL,
+                    ev REAL,
+                    signal_score REAL,
+                    buffer_f REAL,
+                    sigma_used REAL,
+                    bias_correction_f REAL,
+                    actual_settlement_temp_f REAL,
+                    actual_outcome TEXT,
+                    bet_won INTEGER,
+                    forecast_error_f REAL,
+                    closing_market_price REAL,
+                    clv REAL,
+                    contracts INTEGER,
+                    stake REAL,
+                    payout REAL,
+                    profit REAL,
+                    model_version TEXT DEFAULT 'v1.0'
                 )
                 """
             )

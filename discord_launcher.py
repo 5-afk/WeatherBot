@@ -568,6 +568,169 @@ class BotLauncher:
                 f"Raw: `{obs.get('raw_metar', 'N/A')}`"
             )
 
+        @self.bot.command(name="calibration")
+        async def calibration_cmd(ctx):
+            """Generate full calibration report from settled trade history."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            from src.calibration import CalibrationEngine
+
+            db_path = str(PROJECT_ROOT / "data" / "positions.db")
+            engine = CalibrationEngine(db_path)
+            report = engine.full_report()
+
+            if "error" in report:
+                await ctx.send(f"⚠️ {report['error']}")
+                return
+
+            n = report["total_settled_trades"]
+            wr = report["overall_win_rate"] * 100
+            profit = report["total_profit"]
+            brier = report["brier_score"]
+            brier_v = report["brier_verdict"]
+            clv = report["clv_analysis"]
+
+            msg = (
+                f"📊 **WhetherBot Calibration Report**\n"
+                f"Trades settled: {n} | Win rate: {wr:.1f}% | "
+                f"Total P&L: ${profit:+.2f}\n\n"
+                f"**Brier Score:** {brier} {brier_v}\n"
+                f"**CLV:** {clv.get('avg_clv', 'N/A')} "
+                f"({clv.get('positive_clv_pct', 'N/A')}% positive) "
+                f"{clv.get('verdict', '')}\n\n"
+            )
+
+            msg += "**Calibration Curve:**\n"
+            for bucket in report["calibration_curve"]:
+                arrow = (
+                    "⬆️" if bucket["error"] > 0.05
+                    else "⬇️" if bucket["error"] < -0.05
+                    else "✅"
+                )
+                msg += (
+                    f"{arrow} {bucket['bucket']}: "
+                    f"predicted {bucket['predicted']:.0%} → "
+                    f"actual {bucket['actual']:.0%} "
+                    f"(n={bucket['count']})\n"
+                )
+
+            errors = report["forecast_error_by_city"]
+            if errors:
+                msg += "\n**Biggest NWS Bias:**\n"
+                for e in errors[:3]:
+                    msg += (
+                        f"• {e['city']}: {e['avg_forecast_error_f']:+.1f}°F "
+                        f"({e['bias_direction']}) "
+                        f"→ suggest correction {e['suggested_correction']:+.1f}°F\n"
+                    )
+
+            sigmas = report["sigma_accuracy"]
+            if sigmas:
+                msg += "\n**Sigma Accuracy:**\n"
+                for s in sigmas[:3]:
+                    msg += (
+                        f"• {s['city']}: using {s['sigma_used']}°F, "
+                        f"actual MAE {s['actual_mae_f']}°F {s['verdict']}\n"
+                    )
+
+            msg += "\n**Win Rate by Hours Until Settlement:**\n"
+            for w in report["win_rate_by_hours"]:
+                msg += (
+                    f"• {w['window']}: {w['win_rate']:.0%} win rate "
+                    f"(n={w['trade_count']})\n"
+                )
+
+            if len(msg) > 1900:
+                msg = msg[:1900] + "\n...(truncated)"
+
+            await ctx.send(msg)
+
+        @self.bot.command(name="improvemodel")
+        async def improvemodel_cmd(ctx):
+            """Suggest the single most impactful model improvement right now."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            from src.calibration import CalibrationEngine
+
+            db_path = str(PROJECT_ROOT / "data" / "positions.db")
+            engine = CalibrationEngine(db_path)
+            trades = engine.get_settled_trades()
+
+            if len(trades) < 10:
+                await ctx.send(
+                    f"⚠️ Only {len(trades)} settled trades — need at least 10 "
+                    f"for meaningful analysis. Keep trading and check back!"
+                )
+                return
+
+            report = engine.full_report()
+            errors = report["forecast_error_by_city"]
+            sigmas = report["sigma_accuracy"]
+            clv = report["clv_analysis"]
+            brier = report["brier_score"]
+            curve = report["calibration_curve"]
+
+            recommendations = []
+
+            if clv.get("avg_clv") is not None and clv["avg_clv"] < -0.02:
+                recommendations.append({
+                    "priority": 1,
+                    "issue": "Negative CLV — betting too early before signal is clear",
+                    "fix": "Raise MIN_SIGNAL_SCORE from 0.75 to 0.80, or require METAR confirmation before betting",
+                    "impact": "HIGH",
+                })
+
+            for s in sigmas:
+                if s["trade_count"] >= 5 and s["ratio"] and s["ratio"] > 1.3:
+                    recommendations.append({
+                        "priority": 2,
+                        "issue": (
+                            f"{s['city']} sigma too small ({s['sigma_used']}°F) — "
+                            f"actual MAE is {s['actual_mae_f']}°F"
+                        ),
+                        "fix": f"Change {s['city']} summer sigma to {s['suggested_sigma']}°F in CITY_SIGMA",
+                        "impact": "HIGH",
+                    })
+
+            for e in errors:
+                if e["trade_count"] >= 5 and abs(e["avg_forecast_error_f"]) > 2.0:
+                    recommendations.append({
+                        "priority": 3,
+                        "issue": f"{e['city']} NWS bias {e['avg_forecast_error_f']:+.1f}°F",
+                        "fix": f"Update CITY_BIAS_CORRECTIONS['{e['city']}'] by {e['suggested_correction']:+.1f}°F",
+                        "impact": "MEDIUM",
+                    })
+
+            for bucket in curve:
+                if bucket["count"] >= 5 and bucket["error"] < -0.10:
+                    recommendations.append({
+                        "priority": 4,
+                        "issue": (
+                            f"Overconfident in {bucket['bucket']} range — "
+                            f"predicting {bucket['predicted']:.0%} but winning {bucket['actual']:.0%}"
+                        ),
+                        "fix": "Increase sigma for markets in this probability range",
+                        "impact": "MEDIUM",
+                    })
+
+            if not recommendations:
+                await ctx.send(
+                    f"✅ No significant issues found in {len(trades)} trades. "
+                    f"Brier score: {brier}. Keep collecting data!"
+                )
+                return
+
+            top = sorted(recommendations, key=lambda x: x["priority"])[0]
+            await ctx.send(
+                f"🎯 **Single Most Impactful Improvement:**\n\n"
+                f"**Issue:** {top['issue']}\n"
+                f"**Fix:** {top['fix']}\n"
+                f"**Impact:** {top['impact']}\n\n"
+                f"Make this ONE change, then run `!calibration` again after "
+                f"10+ more trades to confirm improvement.\n"
+                f"Do not change anything else until that is confirmed."
+            )
+
         @self.bot.command(name="ps")
         async def ps_cmd(ctx):
             """Show discord_launcher processes for remote diagnostics."""
@@ -639,6 +802,8 @@ class BotLauncher:
                 "!auditpositions — audit all open positions, auto-sell if needed\n"
                 "!sellposition <ticker> — manually sell a specific open position\n"
                 "!metar <station> — show live METAR temperature for a station\n"
+                "!calibration — full calibration report (Brier score, CLV, city bias, sigma accuracy)\n"
+                "!improvemodel — single most impactful model improvement to make right now\n"
                 "!resetstate — sync cash balance and close settled positions\n"
                 "!clearhalt — clear permanent halt and reset drawdown to current balance\n"
                 "!logs    — show last 30 log lines\n"
@@ -689,6 +854,7 @@ class BotLauncher:
         required_commands = {
             "start", "stop", "restart", "scan", "pause", "resume", "pnl",
             "status", "balance", "positions", "syncpositions", "auditpositions", "sellposition", "metar",
+            "calibration", "improvemodel",
             "resetstate", "clearhalt", "logs", "logsfull",
             "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
         }

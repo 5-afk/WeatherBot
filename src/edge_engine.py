@@ -12,6 +12,8 @@ from datetime import date, datetime, timezone
 from src.kalshi_client import KalshiMarket
 from src.weather_client import NwsForecast, get_sigma
 
+MODEL_VERSION = os.getenv("MODEL_VERSION", "v1.0")
+
 
 def _norm_cdf(x: float, mean: float, sigma: float) -> float:
     """Return P(X <= x) for a normal distribution with the given mean and sigma."""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,12 +19,12 @@ import requests
 from src.bot_control import is_paused
 from src.claude_checker import ClaudeChecker, ClaudeDecision
 from src.contract_validator import ContractValidator, VALIDATION_CHECK_COUNT
-from src.edge_engine import EdgeDecision, EdgeEngine, estimate_probability
+from src.edge_engine import MODEL_VERSION, EdgeDecision, EdgeEngine, estimate_probability
 from src.metar_tracker import MetarTracker
 from src.kalshi_client import KalshiClient, KalshiMarket
 from src.position_sizer import PositionSize, PositionSizer
 from src.risk_manager import RiskManager
-from src.weather_client import CityConfig, NwsForecast, WeatherClient
+from src.weather_client import CITY_BIAS_CORRECTIONS, CityConfig, NwsForecast, WeatherClient, get_sigma
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -758,6 +759,67 @@ class Trader:
             dry_run=False,
             order_id=order_id,
         )
+
+        validation = edge.validation_result
+        metar = edge.metar_assessment or {}
+        station_id = ""
+        strike_type = "greater"
+        upper_threshold: float | None = None
+        if validation is not None:
+            station_id = getattr(validation, "confirmed_station", None) or ""
+            strike_type = getattr(validation, "confirmed_strike_type", None) or "greater"
+            upper_threshold = getattr(validation, "confirmed_upper_threshold", None)
+        if not station_id:
+            rules_primary = str(market.raw.get("rules_primary") or "")
+            station_id = self.weather.parse_settlement_station(rules_primary) or ""
+
+        target_date = (
+            market.settlement_time.date()
+            if market.settlement_time is not None
+            else datetime.now(timezone.utc).date()
+        )
+        sigma_used = get_sigma(station_id, target_date) if station_id else 0.0
+        bias_correction = CITY_BIAS_CORRECTIONS.get(station_id, 0.0)
+        nws_forecast = edge.nws_forecast_temperature_f or 0.0
+        threshold = edge.threshold_f or 0.0
+        buffer_f = (
+            abs(nws_forecast - threshold)
+            if edge.nws_forecast_temperature_f is not None and edge.threshold_f is not None
+            else 0.0
+        )
+        market_type = (edge.market_type or "HIGH").upper()
+        metar_obs = (
+            metar.get("observed_min_f")
+            if market_type == "LOW"
+            else metar.get("observed_max_f")
+        )
+
+        cal_id = self.risk.log_prediction(
+            ticker=market.ticker,
+            city=city.name,
+            station_id=station_id,
+            market_type=market_type,
+            strike_type=strike_type,
+            side=edge.side or "yes",
+            threshold_f=threshold,
+            upper_threshold_f=upper_threshold,
+            hours_until_settlement=edge.hours_until_settlement or 0.0,
+            nws_forecast_f=nws_forecast,
+            metar_observed_max_f=metar_obs,
+            model_probability=edge.model_probability or 0.0,
+            market_price=edge.ask_price or 0.0,
+            edge=edge.edge or 0.0,
+            ev=edge.ev or 0.0,
+            signal_score=edge.signal_score,
+            buffer_f=buffer_f,
+            sigma_used=sigma_used,
+            bias_correction_f=bias_correction,
+            contracts=filled_count,
+            stake=actual_stake,
+            model_version=MODEL_VERSION,
+        )
+        logging.info("[CALIBRATION] Logged prediction #%d for %s", cal_id, market.ticker)
+
         self.risk.record_decision(
             ticker=market.ticker,
             city=city.name,
@@ -1209,6 +1271,25 @@ class Trader:
                     )
 
                 self.risk.close_position(ticker, pnl, payout)
+
+                rules_primary = str(m.get("rules_primary") or "")
+                settlement_station = self.weather.parse_settlement_station(rules_primary) or ""
+                actual_temp = self._fetch_settlement_temp(ticker, settlement_station)
+                closing_price = self.kalshi._price_to_float(m.get("yes_ask_dollars")) or 0.0
+                self.risk.settle_prediction(
+                    ticker=ticker,
+                    actual_temp_f=actual_temp,
+                    actual_outcome=result,
+                    closing_price=closing_price,
+                    payout=payout,
+                )
+                logging.info(
+                    "[CALIBRATION] Settlement recorded for %s: actual=%.1f°F outcome=%s",
+                    ticker,
+                    actual_temp or 0,
+                    result,
+                )
+
                 try:
                     self.risk.sync_from_kalshi(self.kalshi)
                 except Exception as exc:
@@ -1235,6 +1316,60 @@ class Trader:
 
             except Exception as exc:
                 logging.warning("[SETTLEMENT] Error checking %s: %s", ticker, exc)
+
+    def _fetch_settlement_temp(self, ticker: str, station_id: str) -> float | None:
+        """
+        Fetch the actual settlement temperature from the NWS Daily Climate
+        Report (CLI) for the given station. This is the official value
+        Kalshi uses for settlement.
+        """
+        try:
+            date_match = re.search(r"(\d{2})([A-Z]{3})(\d{2})", ticker)
+            if not date_match:
+                return None
+            day, mon, year = date_match.groups()
+            month_map = {
+                "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+            }
+            month = month_map.get(mon.upper())
+            if not month:
+                return None
+
+            station_to_wfo = {
+                "KNYC": ("OKX", "NYC"),
+                "KMDW": ("LOT", "CHI"),
+                "KMIA": ("MFL", "MIA"),
+                "KLAX": ("LOX", "LAX"),
+                "KDEN": ("BOU", "DEN"),
+                "KOKC": ("OUN", "OKC"),
+                "KBOS": ("BOX", "BOS"),
+                "KDCA": ("LWX", "DCA"),
+                "KSEA": ("SEW", "SEA"),
+                "KSFO": ("MTR", "SFO"),
+                "KATL": ("FFC", "ATL"),
+                "KDFW": ("FWD", "DFW"),
+                "KMSP": ("MPX", "MSP"),
+            }
+            wfo_info = station_to_wfo.get(station_id)
+            if not wfo_info:
+                return None
+            wfo, cli_station = wfo_info
+
+            url = (
+                f"https://forecast.weather.gov/product.php"
+                f"?site={wfo}&product=CLI&issuedby={cli_station}"
+            )
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "WhetherBot/1.0"})
+            text = resp.text
+
+            max_match = re.search(r"MAXIMUM\s+(\d+)", text)
+            if max_match:
+                return float(max_match.group(1))
+            return None
+        except Exception as exc:
+            logging.warning("[CALIBRATION] Could not fetch CLI temp for %s: %s", ticker, exc)
+            return None
 
     def _user_ping(self) -> str:
         """Return a Discord user mention string for notifications."""
