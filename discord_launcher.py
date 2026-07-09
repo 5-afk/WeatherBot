@@ -9,6 +9,8 @@ import subprocess
 import logging
 import asyncio
 import sqlite3
+import threading
+import socket
 from datetime import datetime
 from pathlib import Path
 import zoneinfo
@@ -21,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from src.bot_control import request_scan, set_paused
 from src.kalshi_client import KalshiClient
+from src.atlas_control import register_launcher
 
 
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
@@ -62,8 +65,11 @@ class BotLauncher:
         intents = discord.Intents.default()
         intents.message_content = True
         self.bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+        self._api_thread = None
         self._register_commands()
         self._register_tasks()
+        register_launcher(self)
+        self._start_atlas_api()
 
     def _register_commands(self):
         """Register all launcher commands."""
@@ -783,6 +789,35 @@ class BotLauncher:
             except Exception as exc:
                 await ctx.send(f"Error running git status: {exc}")
 
+        @self.bot.command(name="dashboard")
+        async def dashboard_cmd(ctx):
+            """Link to the ATLAS Command Center dashboard."""
+            if str(ctx.channel.id) != launcher.channel_id:
+                return
+            port = int(os.getenv("ATLAS_PORT", "5000"))
+            dry_run = os.getenv("DRY_RUN", "true")
+            mode = "DRY RUN" if dry_run.lower() == "true" else "LIVE"
+            from src.api import AGENTS, _load_agents
+
+            _load_agents()
+            agent_count = len(AGENTS)
+            urls = f"http://localhost:{port}"
+            if os.getenv("ATLAS_LAN", "").strip() == "1":
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    lan_ip = s.getsockname()[0]
+                    s.close()
+                    urls += f"\nhttp://{lan_ip}:{port}"
+                except Exception:
+                    pass
+            embed = discord.Embed(
+                title="ATLAS Command Center",
+                description=f"**Mode:** {mode}\n**Agents:** {agent_count}\n\n{urls}",
+                url=f"http://localhost:{port}",
+            )
+            await ctx.send(embed=embed)
+
         @self.bot.command(name="help")
         async def help_command(ctx):
             """Show all launcher commands."""
@@ -811,6 +846,7 @@ class BotLauncher:
                 "!logssince [hours] — upload recent logs\n"
                 "!ps      — show launcher processes\n"
                 "!gitstatus — show git status and latest commit\n"
+                "!dashboard — ATLAS Command Center URL\n"
                 "!pocket  — show pocketed profits\n"
                 "!budget  — show compounding budget\n"
                 "!golive CONFIRM — switch to live trading\n"
@@ -856,7 +892,7 @@ class BotLauncher:
             "status", "balance", "positions", "syncpositions", "auditpositions", "sellposition", "metar",
             "calibration", "improvemodel",
             "resetstate", "clearhalt", "logs", "logsfull",
-            "logssince", "ps", "gitstatus", "pocket", "budget", "golive", "help",
+            "logssince", "ps", "gitstatus", "dashboard", "pocket", "budget", "golive", "help",
         }
         registered = {command.name for command in self.bot.commands}
         missing = sorted(required_commands - registered)
@@ -881,6 +917,22 @@ class BotLauncher:
                 await launcher._send_channel("🚨 KalshiBot crashed unexpectedly! Use !start to restart.")
 
         self.health_check = health_check
+
+    def _start_atlas_api(self) -> None:
+        """Start Flask ATLAS API in a daemon thread (never blocks bot startup)."""
+        port = int(os.getenv("ATLAS_PORT", "5000"))
+
+        def _run():
+            try:
+                from src.api import run_api
+                run_api(host="127.0.0.1", port=port)
+            except OSError as exc:
+                logging.warning("ATLAS API port %d unavailable — continuing without dashboard: %s", port, exc)
+            except Exception as exc:
+                logging.warning("ATLAS API failed to start: %s", exc)
+
+        self._api_thread = threading.Thread(target=_run, daemon=True, name="atlas-api")
+        self._api_thread.start()
 
     def run(self):
         """Run the Discord launcher."""

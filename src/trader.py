@@ -19,6 +19,7 @@ import requests
 from src.bot_control import is_paused
 from src.claude_checker import ClaudeChecker, ClaudeDecision
 from src.contract_validator import ContractValidator, VALIDATION_CHECK_COUNT
+from src import atlas_client
 from src.edge_engine import MODEL_VERSION, EdgeDecision, EdgeEngine, estimate_probability
 from src.metar_tracker import MetarTracker
 from src.kalshi_client import KalshiClient, KalshiMarket
@@ -135,8 +136,85 @@ class Trader:
             except Exception as exc:
                 logging.warning("KLAX forecast vs observation check failed: %s", exc)
 
+        atlas_client.register_agent(atlas_client.whetherbot_manifest(pid=os.getpid()))
+        atlas_client.start_heartbeat_loop(self._atlas_state)
+
+    def _reload_config_if_dirty(self) -> None:
+        """Hot-reload .env when ATLAS or operator updates config."""
+        flag = DATA_DIR / "config_dirty.flag"
+        if not flag.exists():
+            return
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
+        self.dry_run = env_bool("DRY_RUN", True)
+        self.edge_engine = EdgeEngine()
+        self.position_sizer = PositionSizer()
+        flag.unlink(missing_ok=True)
+        logging.info("[CONFIG] Hot-reloaded .env at scan loop")
+
+    def _atlas_state(self) -> dict[str, Any]:
+        """Snapshot for ATLAS heartbeat."""
+        from src.bot_control import is_paused
+
+        max_calls = int(os.getenv("MAX_CLAUDE_CALLS_PER_DAY", "5"))
+        status = "paused" if is_paused() else "running"
+        last = None
+        if self.last_scan_time:
+            last = {
+                "ts": self.last_scan_time.astimezone().isoformat(),
+                "markets_checked": getattr(self, "_last_markets_checked", 0),
+                "candidates": getattr(self, "_last_candidate_count", 0),
+            }
+        return {
+            "status": status,
+            "mode": "DRY_RUN" if self.dry_run else "LIVE",
+            "next_scan": None,
+            "last_scan": last,
+            "claude_calls": {"used": self._claude_calls_today, "limit": max_calls},
+        }
+
+    def _persist_candidates(
+        self,
+        candidates: list[tuple[CityConfig, KalshiMarket, EdgeDecision]],
+        *,
+        claude_decision: ClaudeDecision | None = None,
+        bet_ticker: str | None = None,
+    ) -> None:
+        """Write last scan candidates for ATLAS /api/candidates."""
+        rows = []
+        for city, market, edge in candidates:
+            cd = "approved" if claude_decision and claude_decision.approved and claude_decision.ticker == market.ticker else (
+                "rejected" if claude_decision and not claude_decision.approved else "pending"
+            )
+            buffer = None
+            if edge.threshold_f is not None and edge.nws_forecast_temperature_f is not None:
+                buffer = round(abs(edge.nws_forecast_temperature_f - edge.threshold_f), 2)
+            metar_ok = False
+            if edge.metar_assessment and isinstance(edge.metar_assessment, dict):
+                metar_ok = bool(edge.metar_assessment.get("confirmed") or edge.metar_assessment.get("supports_side"))
+            rows.append({
+                "ticker": market.ticker,
+                "city": city.name,
+                "side": (edge.side or "").upper(),
+                "ev": round(edge.ev or 0, 4),
+                "signal_score": round(edge.signal_score, 3),
+                "buffer_f": buffer,
+                "metar_confirmed": metar_ok,
+                "claude_decision": cd,
+                "claude_reason": claude_decision.reason if claude_decision else "",
+                "bet_placed": bet_ticker == market.ticker if bet_ticker else False,
+                "price": round(edge.limit_price or edge.ask_price or 0, 4),
+            })
+        payload = {"ts": datetime.now(timezone.utc).isoformat(), "candidates": rows}
+        try:
+            (DATA_DIR / "candidates.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logging.debug("Failed to persist candidates: %s", exc)
+
     def run_full_pipeline(self) -> None:
         """Run one full scan: collect markets, evaluate math, call Claude once, trade."""
+        self._reload_config_if_dirty()
         self.paused = is_paused()
         if self.paused:
             logging.info("[CYCLE] Bot is paused — skipping scan.")
@@ -229,6 +307,9 @@ class Trader:
         )
         if not candidates:
             logging.info("[CYCLE] No qualifying candidates — scan complete")
+            self._last_markets_checked = total_checked
+            self._last_candidate_count = 0
+            self._persist_candidates([])
             self._maybe_record_day_end()
             self._send_scan_summary(real_balance, total_checked, 0)
             return
@@ -236,13 +317,17 @@ class Trader:
         if self._claude_calls_today >= max_calls:
             best_city, best_market, best_edge = candidates[0]
             logging.info("No Claude available — using top math signal")
+            dec = ClaudeDecision("GO", "Math-only: Claude limit reached")
+            self._persist_candidates(candidates, claude_decision=dec, bet_ticker=best_market.ticker)
             self._execute_trade(
                 best_city,
                 best_market,
                 best_edge,
-                ClaudeDecision("GO", "Math-only: Claude limit reached"),
+                dec,
                 real_balance,
             )
+            self._last_markets_checked = total_checked
+            self._last_candidate_count = len(candidates)
             self._maybe_record_day_end()
             self._send_scan_summary(real_balance, total_checked, len(candidates))
             return
@@ -258,15 +343,20 @@ class Trader:
         self._scan_signals = getattr(self, "_scan_signals", 0) + 1
         claude_decision = self.claude.check_batch(batch, balance=real_balance)
         logging.info("Claude decision=%s reason=%s", claude_decision.decision, claude_decision.reason)
+        self._persist_candidates(candidates, claude_decision=claude_decision)
         if not claude_decision.approved:
             logging.warning("[SKIP] Claude rejected all candidates: %s", claude_decision.reason)
+            self._last_markets_checked = total_checked
+            self._last_candidate_count = len(candidates)
             self._maybe_record_day_end()
             self._send_scan_summary(real_balance, total_checked, len(candidates))
             return
 
         best_city, best_market, best_edge = self._select_candidate(candidates, claude_decision.ticker)
+        self._persist_candidates(candidates, claude_decision=claude_decision, bet_ticker=best_market.ticker)
         self._execute_trade(best_city, best_market, best_edge, claude_decision, real_balance)
-        self._maybe_record_day_end()
+        self._last_markets_checked = total_checked
+        self._last_candidate_count = len(candidates)
         self._send_scan_summary(real_balance, total_checked, len(candidates))
 
     def _evaluate_all_markets(
