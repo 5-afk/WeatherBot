@@ -6,7 +6,11 @@ export default defineConfig(({ mode }) => {
   const apiTarget = env.VITE_API_URL || "http://localhost:5000";
   console.log(`[ATLAS] Proxying /api → ${apiTarget}`);
   return {
-    plugins: [react()],
+    plugins: [
+      react({
+        jsxRuntime: "automatic",
+      }),
+    ],
     server: {
       host: true, // ATLAS-NOTE: allow phone on Tailscale to open dev server
       proxy: {
