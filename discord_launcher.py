@@ -58,6 +58,9 @@ class BotLauncher:
 
     def __init__(self):
         """Create Discord command handlers and initialize process state."""
+        # Start ATLAS Flask API as daemon thread immediately
+        self._start_atlas_api()
+
         self.process = None
         self.process_log_file = None
         self.start_time = None
@@ -65,11 +68,9 @@ class BotLauncher:
         intents = discord.Intents.default()
         intents.message_content = True
         self.bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-        self._api_thread = None
         self._register_commands()
         self._register_tasks()
         register_launcher(self)
-        self._start_atlas_api()
 
     def _register_commands(self):
         """Register all launcher commands."""
@@ -919,31 +920,27 @@ class BotLauncher:
         self.health_check = health_check
 
     def _start_atlas_api(self) -> None:
-        """Start ATLAS Flask API in a daemon thread before Discord connects."""
-        port = int(os.getenv("ATLAS_PORT", "5000"))
-        host = "0.0.0.0" if os.getenv("ATLAS_LAN", "0").strip() == "1" else "127.0.0.1"
-        logging.info("ATLAS API starting on %s:%d", host, port)
+        """Start the ATLAS Flask API on a background daemon thread."""
+        atlas_port = int(os.getenv("ATLAS_PORT", "5000"))
+        atlas_host = "0.0.0.0" if os.getenv("ATLAS_LAN", "0") == "1" else "127.0.0.1"
 
         try:
-            from src.api import run_api
+            from src.api import atlas as flask_app
+
+            self._api_thread = threading.Thread(
+                target=lambda: flask_app.run(
+                    host=atlas_host,
+                    port=atlas_port,
+                    debug=False,
+                    use_reloader=False,
+                ),
+                daemon=True,
+                name="atlas-api",
+            )
+            self._api_thread.start()
+            logging.info("ATLAS API started on %s:%d", atlas_host, atlas_port)
         except Exception as exc:
-            logging.error("ATLAS API import failed — dashboard disabled: %s", exc, exc_info=True)
-            return
-
-        if self._api_thread and self._api_thread.is_alive():
-            logging.info("ATLAS API thread already running")
-            return
-
-        def _run() -> None:
-            try:
-                run_api(host=host, port=port)
-            except OSError as exc:
-                logging.error("ATLAS API port %d unavailable: %s", port, exc, exc_info=True)
-            except Exception as exc:
-                logging.error("ATLAS API failed to start: %s", exc, exc_info=True)
-
-        self._api_thread = threading.Thread(target=_run, daemon=True, name="atlas-api")
-        self._api_thread.start()
+            logging.warning("ATLAS API failed to start: %s", exc)
 
     def run(self):
         """Run the Discord launcher."""
