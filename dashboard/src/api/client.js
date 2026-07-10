@@ -1,61 +1,93 @@
-/** Resolve ATLAS Flask API base URL from VITE_API_URL or sensible defaults. */
-export function getApiBase() {
-  const envUrl = import.meta.env.VITE_API_URL;
-  if (envUrl !== undefined && envUrl !== null && String(envUrl).trim() !== "") {
-    return String(envUrl).replace(/\/$/, "");
-  }
-  if (import.meta.env.DEV) {
-    return "";
-  }
-  if (typeof window !== "undefined" && window.location.origin.startsWith("http")) {
-    return window.location.origin;
-  }
-  return "";
-}
-
-export const API_BASE = getApiBase();
+// ATLAS-NOTE: Always use relative /api paths — Vite proxy in dev, same-origin when served by Flask.
+// VITE_API_URL configures the proxy target in vite.config.js only (not used as fetch base).
+// VITE_DASHBOARD_SECRET must match server DASHBOARD_SECRET; restart pnpm dev after .env.local edits.
 
 const SECRET = import.meta.env.VITE_DASHBOARD_SECRET || "";
 
-/** Headers for mutating API calls (POST). */
-export function authHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (SECRET) {
-    headers["X-Atlas-Secret"] = SECRET;
-  }
-  return headers;
+/** Sentinel returned when Kelly/API is unreachable (network or proxy ECONNREFUSED). */
+export const OFFLINE_RESULT = Object.freeze({
+  ok: false,
+  offline: true,
+  error: "Kelly is offline",
+});
+
+export function isOffline(data) {
+  return Boolean(data && data.offline);
 }
 
-export async function api(path, opts = {}) {
-  const method = (opts.method || "GET").toUpperCase();
-  const needsAuth = method !== "GET" && method !== "HEAD";
-  const baseHeaders = needsAuth ? authHeaders() : { "Content-Type": "application/json" };
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...opts,
-    headers: { ...baseHeaders, ...(opts.headers || {}) },
-  });
+export class ApiError extends Error {
+  constructor(status, body) {
+    super(`API ${status}: ${body}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export function authHeaders(extra = {}) {
+  return {
+    ...extra,
+    ...(SECRET ? { "X-Atlas-Secret": SECRET } : {}),
+  };
+}
+
+function offlineSentinel(message) {
+  console.warn(`[ATLAS] unreachable:`, message);
+  return { ...OFFLINE_RESULT, error: message || OFFLINE_RESULT.error };
+}
+
+/**
+ * @param {string} path - Relative API path e.g. `/api/status`
+ * @param {{ method?: string, body?: unknown, signal?: AbortSignal }} opts
+ */
+export async function api(path, { method = "GET", body, signal } = {}) {
+  const upper = method.toUpperCase();
+  const isGet = upper === "GET" || upper === "HEAD";
+
+  let res;
+  try {
+    res = await fetch(path, {
+      method: upper,
+      headers: {
+        ...(body != null ? { "Content-Type": "application/json" } : {}),
+        ...(upper !== "GET" && upper !== "HEAD" && SECRET ? { "X-Atlas-Secret": SECRET } : {}),
+      },
+      body: body != null ? JSON.stringify(body) : undefined,
+      signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    if (isGet) return offlineSentinel(e.message);
+    throw new ApiError(0, `network: ${e.message}`);
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    let message = `${res.status} ${res.statusText}`;
-    try {
-      const errJson = JSON.parse(text);
-      if (errJson.error) message = errJson.error;
-    } catch {
-      if (text) message = `${message}: ${text.slice(0, 200)}`;
+    // Vite proxy surfaces ECONNREFUSED as 500/502/504
+    if (isGet && (res.status >= 500 || res.status === 0)) {
+      return offlineSentinel(text || `HTTP ${res.status}`);
     }
-    throw new Error(message);
+    throw new ApiError(res.status, text);
   }
 
   if (res.status === 204) return null;
 
-  const json = await res.json();
-  if (json && typeof json.ok === "boolean" && !json.ok) {
-    throw new Error(json.error || `API error ${res.status}`);
+  let json;
+  try {
+    json = await res.json();
+  } catch (e) {
+    if (isGet) return offlineSentinel(e.message);
+    throw new ApiError(res.status, "invalid JSON");
   }
-  return json.data;
+
+  if (json && typeof json.ok === "boolean" && !json.ok) {
+    if (isGet) return offlineSentinel(json.error || "unknown error");
+    throw new ApiError(res.status, json.error || "unknown error");
+  }
+
+  return json?.data !== undefined ? json.data : json;
 }
 
 export async function apiPost(path, body) {
-  return api(path, { method: "POST", body: JSON.stringify(body ?? {}) });
+  return api(path, { method: "POST", body });
 }

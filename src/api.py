@@ -73,17 +73,7 @@ STATIONS = [
 atlas = Flask(__name__, static_folder=None)
 CORS(
     atlas,
-    resources={
-        r"/api/*": {
-            "origins": [
-                "null",
-                r"http://localhost:*",
-                r"http://127.0.0.1:*",
-                r"http://192.168.*",
-                r"http://10.*",
-            ],
-        },
-    },
+    resources={r"/api/*": {"origins": "*"}},
     allow_headers=["Content-Type", "X-Atlas-Secret"],
     methods=["GET", "POST", "OPTIONS"],
     max_age=600,
@@ -93,7 +83,7 @@ CORS(
 DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET", "")
 _MUTATE_LAST: dict[str, float] = {}
 _MUTATE_LOCK = threading.Lock()
-_MUTATE_MIN_INTERVAL = 0.5
+_MUTATE_MIN_INTERVAL = 0.2  # ~5 req/s per IP on mutating endpoints
 
 
 def check_secret() -> None:
@@ -113,14 +103,13 @@ def _atlas_before_request() -> Any:
     path = request.path
     if request.method == "POST" and path.startswith("/api/"):
         check_secret()
-        if path in ("/api/control", "/api/sell"):
-            ip = request.remote_addr or "unknown"
-            now = time.monotonic()
-            with _MUTATE_LOCK:
-                last = _MUTATE_LAST.get(ip, 0.0)
-                if now - last < _MUTATE_MIN_INTERVAL:
-                    return _err("Rate limited — wait before retrying", 429)
-                _MUTATE_LAST[ip] = now
+        ip = request.remote_addr or "unknown"
+        now = time.monotonic()
+        with _MUTATE_LOCK:
+            last = _MUTATE_LAST.get(ip, 0.0)
+            if now - last < _MUTATE_MIN_INTERVAL:
+                return _err("Rate limited — wait before retrying", 429)
+            _MUTATE_LAST[ip] = now
     return None
 
 
@@ -446,14 +435,11 @@ def _bot_process_status() -> dict[str, Any]:
     pid = ctrl.pid()
     next_scan_at = None
     heartbeat_age_s = None
-    hb_path = DATA_DIR / "heartbeat.ts"
+    hb_path = DATA_DIR / "heartbeat"
+    scan_in_progress = (DATA_DIR / "scan.trigger").exists()
     if hb_path.exists():
         try:
-            raw = hb_path.read_text(encoding="utf-8").strip()
-            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            heartbeat_age_s = round((datetime.now(timezone.utc) - ts).total_seconds(), 1)
+            heartbeat_age_s = round(time.time() - hb_path.stat().st_mtime, 1)
         except Exception:
             pass
     with _agents_lock:
@@ -477,6 +463,7 @@ def _bot_process_status() -> dict[str, Any]:
         "pid": pid,
         "heartbeat_age_s": heartbeat_age_s,
         "next_scan_at": next_scan_at,
+        "scan_in_progress": scan_in_progress,
     }
 
 
@@ -509,6 +496,7 @@ def api_status():
         "bot_pid": bot_proc["pid"],
         "heartbeat_age_s": bot_proc["heartbeat_age_s"],
         "next_scan_at": bot_proc["next_scan_at"],
+        "scan_in_progress": bot_proc.get("scan_in_progress", False),
     })
 
 
@@ -755,17 +743,43 @@ def api_trades():
     city = request.args.get("city", "")
     side = request.args.get("side", "")
     outcome = request.args.get("outcome", "")
+    dry_run = request.args.get("dry_run", "")
     limit = min(int(request.args.get("limit", "200")), 500)
 
     if not DB_PATH.exists():
         return _ok({"trades": [], "summary": {}})
 
+    # ATLAS-NOTE: ROW_NUMBER prevents calibration_log fan-out when joining on ticker alone.
     query = """
-        SELECT id, ticker, city, side, stake, payout, profit, bet_won, bet_placed_at,
-               model_probability, clv
-        FROM calibration_log
-        WHERE actual_outcome IS NOT NULL
-        ORDER BY bet_placed_at DESC
+        SELECT
+            p.id AS position_id,
+            p.ticker,
+            p.city,
+            p.side,
+            p.stake AS position_stake,
+            p.realized_pnl,
+            p.opened_at,
+            p.closed_at,
+            p.dry_run,
+            c.id AS cal_id,
+            c.bet_placed_at,
+            c.model_probability,
+            c.ev,
+            c.signal_score,
+            c.nws_forecast_f,
+            c.actual_settlement_temp_f,
+            c.forecast_error_f,
+            c.profit,
+            c.payout,
+            c.bet_won,
+            c.clv
+        FROM positions p
+        LEFT JOIN (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY id DESC) AS rn
+            FROM calibration_log
+        ) c ON c.ticker = p.ticker AND c.rn = 1
+        WHERE p.status = 'closed'
+        ORDER BY COALESCE(c.bet_placed_at, p.closed_at, p.opened_at) DESC
         LIMIT ?
     """
     with _db_connect() as conn:
@@ -773,50 +787,61 @@ def api_trades():
 
     trades = []
     for r in rows:
+        if dry_run == "0" and int(r.get("dry_run") or 0) == 1:
+            continue
+        if dry_run == "1" and int(r.get("dry_run") or 0) == 0:
+            continue
         if city and city.lower() not in str(r.get("city", "")).lower():
             continue
-        if side and side.upper() != str(r.get("side", "")).upper():
+        side_val = str(r.get("side", "")).upper()
+        if side and side.upper() != side_val:
             continue
-        won = bool(r.get("bet_won"))
+        profit = float(r.get("profit") if r.get("profit") is not None else r.get("realized_pnl") or 0)
+        won = bool(r.get("bet_won")) if r.get("bet_won") is not None else profit > 0
         oc = "win" if won else "loss"
         if outcome and outcome.lower() != oc:
             continue
-        prob = r.get("model_probability")
-        brier_c = None
-        if prob is not None:
-            brier_c = round((prob - (1 if won else 0)) ** 2, 4)
+        stake = float(r.get("position_stake") or r.get("stake") or 0)
         trades.append({
-            "id": r["id"],
-            "date": (r.get("bet_placed_at") or "")[:10],
+            "id": r.get("cal_id") or r.get("position_id"),
+            "position_id": r.get("position_id"),
+            "date": (r.get("bet_placed_at") or r.get("closed_at") or r.get("opened_at") or "")[:10],
             "bot": "whetherbot",
             "ticker": r["ticker"],
             "city": r.get("city", ""),
-            "side": str(r.get("side", "")).upper(),
-            "stake": round(float(r.get("stake") or 0), 2),
+            "side": side_val,
+            "stake": round(stake, 2),
             "payout": round(float(r.get("payout") or 0), 2),
-            "profit": round(float(r.get("profit") or 0), 2),
+            "profit": round(profit, 2),
             "outcome": oc,
-            "brier_contribution": brier_c,
+            "nws_forecast_f": r.get("nws_forecast_f"),
+            "actual_temp_f": r.get("actual_settlement_temp_f"),
+            "forecast_error_f": r.get("forecast_error_f"),
+            "signal_score": r.get("signal_score"),
+            "ev": r.get("ev"),
+            "model_probability": r.get("model_probability"),
+            "clv": r.get("clv"),
         })
 
-    all_trades = trades
-    wins = sum(1 for t in all_trades if t["outcome"] == "win")
-    wr_all = wins / len(all_trades) if all_trades else 0
-    wr10 = sum(1 for t in all_trades[:10] if t["outcome"] == "win") / min(10, len(all_trades)) if all_trades else 0
-    wr20 = sum(1 for t in all_trades[:20] if t["outcome"] == "win") / min(20, len(all_trades)) if all_trades else 0
+    wins = [t for t in trades if t["outcome"] == "win"]
+    losses = [t for t in trades if t["outcome"] == "loss"]
+    wr_all = len(wins) / len(trades) if trades else 0
+    avg_win = sum(t["profit"] for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t["profit"] for t in losses) / len(losses) if losses else 0
     cum = 0.0
     equity = []
-    for t in reversed(all_trades):
+    for t in reversed(trades):
         cum += t["profit"]
         equity.append({"date": t["date"], "cum_pnl": round(cum, 2)})
 
     return _ok({
         "trades": trades,
         "summary": {
-            "total_pnl": round(sum(t["profit"] for t in all_trades), 2),
+            "total_trades": len(trades),
+            "total_pnl": round(sum(t["profit"] for t in trades), 2),
             "winrate_all": round(wr_all, 3),
-            "winrate_10": round(wr10, 3),
-            "winrate_20": round(wr20, 3),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
             "equity_curve": equity,
         },
     })
@@ -1059,10 +1084,9 @@ in its dashboard and have real-time state below plus tools to inspect and contro
 Operator style: terse, precise, quantitative. Lead with the answer. Use tickers and numbers,
 not filler. Never invent data — if state below or a tool can't answer it, say so.
 
-Safety: this system trades real money when MODE=LIVE. Never take a mutating action
-(control_bot, sell_position) unless the operator explicitly asked for it this turn.
-Summarize what a mutating action will do before requesting it. You cannot change mode,
-edit config, or place new orders — direct the operator to the Settings panel or bot cards.
+Safety: this system trades real money when MODE=LIVE. You cannot execute trades or control the bot —
+you analyze and recommend only. Direct the operator to Bot Controls or Settings for actions.
+Summarize risks plainly. Never invent data.
 
 === CURRENT STATE ({now_et}) ===
 MODE: {status_data.get('mode')} | KILLSWITCH: {status_data.get('killswitch')}
@@ -1125,6 +1149,8 @@ def _sell_tool(args: dict) -> dict:
 
 @atlas.route("/api/atlas/chat", methods=["POST"])
 def atlas_chat():
+    from flask import stream_with_context
+
     body = request.get_json(silent=True) or {}
     messages = body.get("messages", [])
     if not messages:
@@ -1140,67 +1166,36 @@ def atlas_chat():
         return _err("anthropic package not installed", 500)
 
     client = anthropic.Anthropic(api_key=api_key)
-    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
-    if "haiku" in model.lower():
-        model = "claude-sonnet-5"
-
-    tools = [
-        {"name": "get_positions", "description": "Open positions", "input_schema": {"type": "object", "properties": {}}},
-        {"name": "get_metar", "description": "METAR obs", "input_schema": {"type": "object", "properties": {"station": {"type": "string"}}}},
-        {"name": "get_calibration", "description": "Calibration stats", "input_schema": {"type": "object", "properties": {}}},
-        {"name": "get_candidates", "description": "Last scan candidates", "input_schema": {"type": "object", "properties": {}}},
-        {"name": "get_logs", "description": "Recent logs", "input_schema": {"type": "object", "properties": {"lines": {"type": "integer"}}}},
-        {"name": "get_config", "description": "Env config (redacted)", "input_schema": {"type": "object", "properties": {}}},
-        {"name": "control_bot", "description": "Control bot", "input_schema": {"type": "object", "properties": {"bot": {"type": "string"}, "action": {"type": "string"}}, "required": ["bot", "action"]}},
-        {"name": "sell_position", "description": "Sell position", "input_schema": {"type": "object", "properties": {"position_id": {"type": "integer"}}, "required": ["position_id"]}},
-    ]
+    # ATLAS-NOTE: verify model id against Anthropic docs at deploy time
+    model = os.getenv("ATLAS_MODEL", os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"))
 
     system = _build_system_prompt()
     system_block: list[dict[str, Any]] = [{"type": "text", "text": system}]
     if len(system) > 4000:
         system_block[0]["cache_control"] = {"type": "ephemeral"}
-    handlers = _tool_handlers()
-    mutating = {"control_bot", "sell_position"}
+
+    chat_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in messages[-20:]
+        if m.get("role") in ("user", "assistant") and m.get("content")
+    ]
 
     def generate():
         try:
             with client.messages.stream(
                 model=model,
-                max_tokens=2000,
+                max_tokens=1500,
                 system=system_block,
-                messages=[{"role": m["role"], "content": m["content"]} for m in messages[-20:]],
-                tools=tools,
+                messages=chat_messages,
             ) as stream:
-                for event in stream:
-                    if event.type == "content_block_delta":
-                        if hasattr(event.delta, "text"):
-                            yield f"data: {json.dumps({'type': 'text', 'delta': event.delta.text})}\n\n"
-                    elif event.type == "content_block_start":
-                        if event.content_block.type == "tool_use":
-                            name = event.content_block.name
-                            tool_id = event.content_block.id
-                            # collect in stream handler below via final message
-                final = stream.get_final_message()
-                for block in final.content:
-                    if block.type == "tool_use":
-                        name = block.name
-                        args = block.input
-                        if name in mutating and _is_live():
-                            req_id = str(uuid.uuid4())[:8]
-                            with _pending_lock:
-                                _pending_actions[req_id] = {"name": name, "args": args}
-                            yield f"data: {json.dumps({'type': 'action_request', 'request_id': req_id, 'name': name, 'args': args})}\n\n"
-                        else:
-                            handler = handlers.get(name)
-                            result = handler(args) if handler else {"error": "unknown tool"}
-                            label = "[DRY RUN] " if _is_dry_run() and name in mutating else ""
-                            yield f"data: {json.dumps({'type': 'action', 'name': name, 'status': 'done', 'result': result, 'label': label})}\n\n"
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                for text in stream.text_stream:
+                    yield f"data: {json.dumps({'text': text})}\n\n"
+            yield "data: [DONE]\n\n"
         except Exception as exc:
             logging.exception("atlas chat error")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
 
-    resp = Response(generate(), mimetype="text/event-stream")
+    resp = Response(stream_with_context(generate()), mimetype="text/event-stream")
     resp.headers["X-Accel-Buffering"] = "no"
     resp.headers["Cache-Control"] = "no-cache"
     return resp

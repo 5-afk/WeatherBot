@@ -1,10 +1,11 @@
-import { createContext, useCallback, useContext, useReducer } from "react";
-import { api, API_BASE, authHeaders } from "../api/client";
+import { createContext, useCallback, useContext, useReducer, useRef } from "react";
+import { api, ApiError, isOffline } from "../api/client";
 import { fmtPnl } from "../utils/format";
 import { usePoller } from "../hooks/usePoller";
 import { initialState, reducer } from "./reducer";
 
 const AtlasContext = createContext(null);
+let toastId = 0;
 
 export function useAtlasStore() {
   const ctx = useContext(AtlasContext);
@@ -14,12 +15,24 @@ export function useAtlasStore() {
 
 export function AtlasProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
+  const chatAbort = useRef(null);
+
+  const pushToast = useCallback((type, message) => {
+    const toast = { id: ++toastId, type, message };
+    dispatch({ type: "PUSH_TOAST", toast });
+    const ms = type === "error" ? 5000 : 3000;
+    setTimeout(() => dispatch({ type: "DISMISS_TOAST", id: toast.id }), ms);
+  }, []);
 
   const refetchStatus = useCallback(async () => {
     try {
       const data = await api("/api/status");
+      if (isOffline(data)) {
+        dispatch({ type: "FETCH_FAIL" });
+        return;
+      }
       dispatch({ type: "FETCH_OK", payload: { status: data }, updated: { status: Date.now() } });
-    } catch (e) {
+    } catch {
       dispatch({ type: "FETCH_FAIL" });
     }
   }, []);
@@ -30,54 +43,43 @@ export function AtlasProvider({ children }) {
       try {
         const result = await api("/api/control", {
           method: "POST",
-          body: JSON.stringify({ bot, action }),
+          body: { bot, action },
         });
-        dispatch({
-          type: "SET_CONTROLS",
-          payload: {
-            pending: null,
-            toast: { type: "success", message: `${action.toUpperCase()} OK — status: ${result.status || "ok"}` },
-          },
-        });
+        if (isOffline(result)) {
+          pushToast("error", "Kelly is offline — control not sent");
+          dispatch({ type: "SET_CONTROLS", payload: { pending: null } });
+          return;
+        }
+        pushToast("success", `${action.toUpperCase()} OK — ${result.status || "ok"}`);
+        dispatch({ type: "SET_CONTROLS", payload: { pending: null } });
         await refetchStatus();
       } catch (e) {
-        dispatch({
-          type: "SET_CONTROLS",
-          payload: {
-            pending: null,
-            lastError: e.message,
-            toast: { type: "error", message: `${action.toUpperCase()} failed: ${e.message}` },
-          },
-        });
+        const msg = e instanceof ApiError ? e.message : String(e);
+        pushToast("error", `${action.toUpperCase()} failed: ${msg}`);
+        dispatch({ type: "SET_CONTROLS", payload: { pending: null, lastError: msg } });
       }
     },
-    [refetchStatus]
+    [refetchStatus, pushToast]
   );
 
-  const sellPosition = useCallback(async (positionId) => {
-    try {
-      const result = await api("/api/sell", {
-        method: "POST",
-        body: JSON.stringify({ position_id: positionId }),
-      });
-      if (result.sold) {
-        dispatch({
-          type: "SET_CONTROLS",
-          payload: { toast: { type: "success", message: `Sold @ ${result.fill_price}, P&L: ${fmtPnl(result.pnl)}` } },
+  const sellPosition = useCallback(
+    async (positionId) => {
+      try {
+        const result = await api("/api/sell", {
+          method: "POST",
+          body: { position_id: positionId },
         });
-      } else {
-        dispatch({
-          type: "SET_CONTROLS",
-          payload: { toast: { type: "warn", message: result.reason || "Sell failed" } },
-        });
+        if (result.sold) {
+          pushToast("success", `Sold @ ${result.fill_price}, P&L: ${fmtPnl(result.pnl)}`);
+        } else {
+          pushToast("warn", result.reason || "Sell failed");
+        }
+      } catch (e) {
+        pushToast("error", e instanceof ApiError ? e.message : String(e));
       }
-    } catch (e) {
-      dispatch({
-        type: "SET_CONTROLS",
-        payload: { toast: { type: "error", message: e.message } },
-      });
-    }
-  }, []);
+    },
+    [pushToast]
+  );
 
   const loadConfig = useCallback(async () => {
     try {
@@ -90,31 +92,47 @@ export function AtlasProvider({ children }) {
 
   const saveConfig = useCallback(
     async (key, value) => {
-      await api("/api/config", { method: "POST", body: JSON.stringify({ key, value }) });
+      await api("/api/config", { method: "POST", body: { key, value } });
+      pushToast("success", "Changes apply on next scan");
       await loadConfig();
     },
-    [loadConfig]
+    [loadConfig, pushToast]
   );
+
+  const stopAtlasChat = useCallback(() => {
+    chatAbort.current?.abort();
+    chatAbort.current = null;
+    dispatch({ type: "ATLAS_DONE_STREAMING" });
+  }, []);
 
   const atlasChat = useCallback(
     async (text) => {
+      if (state.connection === "down") return;
       const userMsg = { role: "user", content: text };
       const messages = [
         ...state.atlasMessages
-          .filter((m) => m.role)
+          .filter((m) => m.role === "user" || m.role === "assistant")
           .map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: text },
-      ];
+      ].slice(-20);
+
       dispatch({ type: "ATLAS_MSG", msg: userMsg });
       dispatch({ type: "ATLAS_STREAMING", streaming: true });
-      const assistantMsg = { role: "assistant", content: "", streaming: true };
-      dispatch({ type: "ATLAS_MSG", msg: assistantMsg });
+      dispatch({ type: "ATLAS_MSG", msg: { role: "assistant", content: "", streaming: true } });
+
+      const controller = new AbortController();
+      chatAbort.current = controller;
+      const SECRET = import.meta.env.VITE_DASHBOARD_SECRET || "";
 
       try {
-        const res = await fetch(`${API_BASE}/api/atlas/chat`, {
+        const res = await fetch("/api/atlas/chat", {
           method: "POST",
-          headers: authHeaders(),
+          headers: {
+            "Content-Type": "application/json",
+            ...(SECRET ? { "X-Atlas-Secret": SECRET } : {}),
+          },
           body: JSON.stringify({ messages }),
+          signal: controller.signal,
         });
 
         if (!res.ok) {
@@ -126,64 +144,37 @@ export function AtlasProvider({ children }) {
         const decoder = new TextDecoder();
         let buffer = "";
 
-        while (true) {
-          const { done, value } = await reader.read();
+        for (;;) {
+          const { value, done } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
-          const parts = buffer.split("\n\n");
-          buffer = parts.pop() || "";
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
 
-          for (const frame of parts) {
+          for (const frame of frames) {
             const line = frame.split("\n").find((l) => l.startsWith("data: "));
             if (!line) continue;
+            const payload = line.slice(6);
+            if (payload === "[DONE]") break;
             try {
-              const evt = JSON.parse(line.slice(6));
-              if (evt.type === "text") {
-                dispatch({ type: "ATLAS_UPDATE_LAST", delta: evt.delta });
-              } else if (evt.type === "action_request") {
-                dispatch({ type: "ATLAS_PENDING", pending: evt });
-              } else if (evt.type === "action") {
-                dispatch({
-                  type: "ATLAS_MSG",
-                  msg: {
-                    role: "system",
-                    content: `[${evt.label || ""}${evt.name}] ${JSON.stringify(evt.result)}`,
-                    action: evt,
-                  },
-                });
-              } else if (evt.type === "error") {
-                dispatch({ type: "ATLAS_UPDATE_LAST", delta: `\n⚠ ${evt.message}` });
-              } else if (evt.type === "done") {
-                dispatch({ type: "ATLAS_DONE_STREAMING" });
-              }
+              const evt = JSON.parse(payload);
+              if (evt.text) dispatch({ type: "ATLAS_UPDATE_LAST", delta: evt.text });
             } catch {
-              /* ignore malformed SSE chunks */
+              /* malformed SSE chunk */
             }
           }
         }
       } catch (e) {
-        dispatch({ type: "ATLAS_UPDATE_LAST", delta: `\n⚠ ${e.message}` });
+        if (e.name !== "AbortError") {
+          dispatch({ type: "ATLAS_UPDATE_LAST", delta: `\n⚠ ${e.message}` });
+        }
+      } finally {
+        chatAbort.current = null;
+        dispatch({ type: "ATLAS_DONE_STREAMING" });
       }
-      dispatch({ type: "ATLAS_DONE_STREAMING" });
     },
-    [state.atlasMessages]
+    [state.atlasMessages, state.connection]
   );
-
-  const atlasConfirm = useCallback(async (requestId) => {
-    try {
-      const result = await api("/api/atlas/confirm", {
-        method: "POST",
-        body: JSON.stringify({ request_id: requestId }),
-      });
-      dispatch({ type: "ATLAS_PENDING", pending: null });
-      dispatch({
-        type: "ATLAS_MSG",
-        msg: { role: "system", content: `✓ Executed ${result.name}: ${JSON.stringify(result.result)}` },
-      });
-    } catch (e) {
-      dispatch({ type: "ATLAS_MSG", msg: { role: "system", content: `✗ Confirm failed: ${e.message}` } });
-    }
-  }, []);
 
   const ctx = {
     state,
@@ -193,8 +184,9 @@ export function AtlasProvider({ children }) {
     loadConfig,
     saveConfig,
     atlasChat,
-    atlasConfirm,
+    stopAtlasChat,
     refetchStatus,
+    pushToast,
   };
   usePoller(dispatch, state);
 

@@ -13,9 +13,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
-MAIN_PID_FILE = DATA_DIR / "main.pid"
-HEARTBEAT_FILE = DATA_DIR / "heartbeat.ts"
+# ATLAS-NOTE: data/bot.pid tracks main.py; discord_launcher uses PROJECT_ROOT/bot.pid for itself.
+PID_FILE = DATA_DIR / "bot.pid"
+HEARTBEAT_FILE = DATA_DIR / "heartbeat"
 MAIN_SCRIPT = PROJECT_ROOT / "main.py"
+STALE_SECONDS = 180
 
 
 def _venv_python() -> str:
@@ -59,7 +61,7 @@ class BotController:
             [_venv_python(), str(MAIN_SCRIPT)],
             **popen_kwargs,
         )
-        MAIN_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+        PID_FILE.write_text(str(proc.pid), encoding="utf-8")
         logging.info("[BotController] Started main.py pid=%s", proc.pid)
         return True
 
@@ -88,7 +90,7 @@ class BotController:
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
                     pass
-        MAIN_PID_FILE.unlink(missing_ok=True)
+        PID_FILE.unlink(missing_ok=True)
         return True
 
     def restart(self) -> bool:
@@ -121,21 +123,16 @@ class BotController:
 
     def _read_pid(self) -> int | None:
         try:
-            return int(MAIN_PID_FILE.read_text(encoding="utf-8").strip())
+            return int(PID_FILE.read_text(encoding="utf-8").strip())
         except (FileNotFoundError, ValueError):
             return None
 
     def _is_stale(self) -> bool:
         if not HEARTBEAT_FILE.exists():
-            return True
+            return self.is_running()
         try:
-            raw = HEARTBEAT_FILE.read_text(encoding="utf-8").strip()
-            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            interval_min = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
-            stale_seconds = interval_min * 2 * 60
-            return (datetime.now(timezone.utc) - ts).total_seconds() > stale_seconds
+            age = time.time() - HEARTBEAT_FILE.stat().st_mtime
+            return age > STALE_SECONDS
         except Exception:
             return True
 

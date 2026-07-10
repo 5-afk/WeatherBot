@@ -216,14 +216,13 @@ class Trader:
             logging.debug("Failed to persist candidates: %s", exc)
 
     def _touch_heartbeat(self) -> None:
-        """Write heartbeat timestamp for ATLAS process liveness checks."""
+        """Touch heartbeat file for ATLAS process liveness checks."""
         try:
-            (DATA_DIR / "heartbeat.ts").write_text(
-                datetime.now(timezone.utc).isoformat(),
-                encoding="utf-8",
-            )
+            hb = DATA_DIR / "heartbeat"
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            hb.touch()
         except Exception as exc:
-            logging.debug("heartbeat write failed: %s", exc)
+            logging.debug("heartbeat touch failed: %s", exc)
 
     def run_full_pipeline(self) -> None:
         """Run one full scan: collect markets, evaluate math, call Claude once, trade."""

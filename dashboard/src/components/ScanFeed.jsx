@@ -1,47 +1,88 @@
+import { useRef, useState } from "react";
 import { useAtlasStore } from "../store/AtlasContext";
+import { Panel } from "./ui/Panel";
 
-const LEVELS = ["BET", "WIN", "LOSS", "SKIP", "CANDIDATE", "ERROR", "INFO"];
+const FILTERS = ["", "CANDIDATE", "BET", "ERROR", "WIN"];
 
 export default function ScanFeed() {
   const { state, dispatch } = useAtlasStore();
   const logs = state.logs || [];
   const filter = state.ui.logFilter;
+  const search = state.ui.logSearch || "";
+  const scrollRef = useRef(null);
+  const [pinned, setPinned] = useState(true);
+  const [newLines, setNewLines] = useState(0);
 
-  const filtered = filter ? logs.filter((l) => l.level === filter) : logs;
+  const filtered = logs.filter((l) => {
+    if (filter && l.level !== filter) return false;
+    if (search && !l.msg?.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    setPinned(atBottom);
+    if (atBottom) setNewLines(0);
+  };
 
   return (
-    <div className="panel col-12">
-      <div className="panel-header">
-        <span>Scan Feed</span>
-        <div className="flex gap-1">
-          <button
-            className={`btn text-xs py-0 px-2 ${!filter ? "btn-primary" : ""}`}
-            onClick={() => dispatch({ type: "SET_UI", payload: { logFilter: "" } })}
-          >
-            ALL
-          </button>
-          {LEVELS.map((l) => (
+    <Panel
+      title="Scan Feed"
+      className={state.connection === "down" ? "offline-dim" : ""}
+      right={
+        <div className="flex flex-wrap gap-1">
+          {FILTERS.map((f) => (
             <button
-              key={l}
-              className={`btn text-xs py-0 px-2 ${filter === l ? "btn-primary" : ""}`}
-              onClick={() => dispatch({ type: "SET_UI", payload: { logFilter: l } })}
+              key={f || "ALL"}
+              type="button"
+              className={`text-[10px] px-1.5 py-0.5 rounded uppercase ${
+                filter === f ? "bg-cyan/15 text-cyan" : "text-text-3"
+              }`}
+              onClick={() => dispatch({ type: "SET_UI", payload: { logFilter: f } })}
             >
-              {l}
+              {f || "ALL"}
             </button>
           ))}
         </div>
+      }
+    >
+      <input
+        className="w-full mb-2 bg-surface-2 border border-border rounded px-2 py-1 text-xs font-mono"
+        placeholder="Search logs…"
+        value={search}
+        onChange={(e) => dispatch({ type: "SET_UI", payload: { logSearch: e.target.value } })}
+      />
+      <div className="relative flex-1 min-h-0">
+        <div
+          ref={scrollRef}
+          className="h-full max-h-[180px] overflow-y-auto scrollbar font-mono text-[12px]"
+          onScroll={onScroll}
+        >
+          {filtered
+            .slice()
+            .reverse()
+            .map((l, i) => (
+              <div key={`${l.ts}-${l.msg}-${i}`} className={`log-line log-${l.level}`}>
+                <span className="text-text-3">{l.ts}</span> [{l.level}] {l.msg}
+              </div>
+            ))}
+        </div>
+        {!pinned && newLines > 0 && (
+          <button
+            type="button"
+            className="absolute bottom-2 right-2 text-[10px] bg-surface-2 border border-border px-2 py-1 rounded"
+            onClick={() => {
+              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+              setPinned(true);
+              setNewLines(0);
+            }}
+          >
+            ▼ RESUME {newLines > 0 && `(${newLines})`}
+          </button>
+        )}
       </div>
-      <div className="panel-body overflow-auto scrollbar mono" style={{ maxHeight: 200, fontSize: 11 }}>
-        {filtered
-          .slice()
-          .reverse()
-          .map((l, i) => (
-            <div key={i} className={`log-line log-${l.level}`}>
-              <span className="text-dim">{l.ts}</span> <span className="text-dim">[{l.bot}]</span>{" "}
-              <span className="text-dim">[{l.level}]</span> {l.msg}
-            </div>
-          ))}
-      </div>
-    </div>
+    </Panel>
   );
 }

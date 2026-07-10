@@ -1,12 +1,22 @@
 import { useAtlasStore } from "../store/AtlasContext";
 
 export default function ConnectionBanner() {
-  const { state } = useAtlasStore();
+  const { state, dispatch } = useAtlasStore();
   if (state.connection === "ok") return null;
-  const cls = state.connection === "down" ? "conn-down" : "conn-degraded";
-  const msg =
-    state.connection === "down"
-      ? "CONNECTION DOWN — API unreachable. Retrying…"
-      : "CONNECTION DEGRADED — last fetch failed";
-  return <div className={`conn-banner ${cls}`}>{msg}</div>;
+
+  const down = state.connection === "down";
+  return (
+    <div className={`conn-banner ${down ? "conn-down" : "conn-degraded"} shrink-0`}>
+      {down ? "KELLY IS OFFLINE — retrying" : "Connection degraded — last fetch failed"}
+      {down && (
+        <button
+          type="button"
+          className="ml-4 underline text-xs uppercase"
+          onClick={() => dispatch({ type: "SET", payload: { pollBackoffMs: 0, failCount: 0 } })}
+        >
+          RETRY NOW
+        </button>
+      )}
+    </div>
+  );
 }

@@ -17,7 +17,10 @@ export const initialState = {
     pending: null,
     lastError: null,
     toast: null,
+    toasts: [],
   },
+  activeTab: "history",
+  mobileView: "status",
   ui: {
     atlasOpen: false,
     settingsOpen: false,
@@ -58,6 +61,18 @@ export function reducer(state, action) {
     }
     case "SET_CONTROLS":
       return { ...state, controls: { ...state.controls, ...action.payload } };
+    case "PUSH_TOAST": {
+      const toasts = [...(state.controls.toasts || []), action.toast].slice(-5);
+      return { ...state, controls: { ...state.controls, toasts, toast: action.toast } };
+    }
+    case "DISMISS_TOAST":
+      return {
+        ...state,
+        controls: {
+          ...state.controls,
+          toasts: (state.controls.toasts || []).filter((t) => t.id !== action.id),
+        },
+      };
     case "ATLAS_MSG":
       return { ...state, atlasMessages: [...state.atlasMessages, action.msg] };
     case "ATLAS_UPDATE_LAST":
