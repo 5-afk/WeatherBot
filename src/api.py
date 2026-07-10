@@ -1230,8 +1230,9 @@ def run_api(host: str | None = None, port: int | None = None) -> None:
     if host is None:
         host = "0.0.0.0" if os.getenv("ATLAS_LAN", "0").strip() == "1" else "127.0.0.1"
     port = port or int(os.getenv("ATLAS_PORT", "5000"))
-    logging.info("ATLAS dashboard: http://%s:%d", host, port)
-    if os.getenv("ATLAS_PRODUCTION", "0").strip() == "1":
+    production = os.getenv("ATLAS_PRODUCTION", "0").strip() == "1"
+    logging.info("ATLAS API listening on http://%s:%d (production=%s)", host, port, production)
+    if production:
         from waitress import serve
 
         serve(atlas, host=host, port=port, threads=8)

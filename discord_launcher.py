@@ -919,17 +919,28 @@ class BotLauncher:
         self.health_check = health_check
 
     def _start_atlas_api(self) -> None:
-        """Start Flask ATLAS API in a daemon thread (never blocks bot startup)."""
+        """Start ATLAS Flask API in a daemon thread before Discord connects."""
         port = int(os.getenv("ATLAS_PORT", "5000"))
+        host = "0.0.0.0" if os.getenv("ATLAS_LAN", "0").strip() == "1" else "127.0.0.1"
+        logging.info("ATLAS API starting on %s:%d", host, port)
 
-        def _run():
+        try:
+            from src.api import run_api
+        except Exception as exc:
+            logging.error("ATLAS API import failed — dashboard disabled: %s", exc, exc_info=True)
+            return
+
+        if self._api_thread and self._api_thread.is_alive():
+            logging.info("ATLAS API thread already running")
+            return
+
+        def _run() -> None:
             try:
-                from src.api import run_api
-                run_api(host="127.0.0.1", port=port)
+                run_api(host=host, port=port)
             except OSError as exc:
-                logging.warning("ATLAS API port %d unavailable — continuing without dashboard: %s", port, exc)
+                logging.error("ATLAS API port %d unavailable: %s", port, exc, exc_info=True)
             except Exception as exc:
-                logging.warning("ATLAS API failed to start: %s", exc)
+                logging.error("ATLAS API failed to start: %s", exc, exc_info=True)
 
         self._api_thread = threading.Thread(target=_run, daemon=True, name="atlas-api")
         self._api_thread.start()
@@ -1357,5 +1368,6 @@ class BotLauncher:
 
 if __name__ == "__main__":
     check_single_instance()
+    logging.info("Discord launcher starting (pid=%s)", os.getpid())
     launcher = BotLauncher()
     launcher.run()
