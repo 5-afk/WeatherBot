@@ -15,6 +15,14 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PORT = int(os.getenv("ATLAS_PORT", "5000"))
 BASE_URL = os.getenv("ATLAS_URL", f"http://127.0.0.1:{DEFAULT_PORT}")
+DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET", "")
+
+
+def _api_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if DASHBOARD_SECRET:
+        headers["X-Atlas-Secret"] = DASHBOARD_SECRET
+    return headers
 
 _heartbeat_thread: threading.Thread | None = None
 _heartbeat_stop = threading.Event()
@@ -31,6 +39,7 @@ def register_agent(manifest: dict[str, Any]) -> bool:
         resp = requests.post(
             f"{BASE_URL}/api/agents/register",
             json=manifest,
+            headers=_api_headers(),
             timeout=3,
         )
         return resp.status_code == 200 and resp.json().get("ok", False)
@@ -45,6 +54,7 @@ def send_heartbeat(payload: dict[str, Any]) -> bool:
         resp = requests.post(
             f"{BASE_URL}/api/agents/heartbeat",
             json=payload,
+            headers=_api_headers(),
             timeout=3,
         )
         return resp.status_code == 200

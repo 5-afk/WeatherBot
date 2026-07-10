@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -160,16 +160,19 @@ class Trader:
         max_calls = int(os.getenv("MAX_CLAUDE_CALLS_PER_DAY", "5"))
         status = "paused" if is_paused() else "running"
         last = None
+        next_scan = None
         if self.last_scan_time:
             last = {
                 "ts": self.last_scan_time.astimezone().isoformat(),
                 "markets_checked": getattr(self, "_last_markets_checked", 0),
                 "candidates": getattr(self, "_last_candidate_count", 0),
             }
+            interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
+            next_scan = (self.last_scan_time + timedelta(minutes=interval)).isoformat()
         return {
             "status": status,
             "mode": "DRY_RUN" if self.dry_run else "LIVE",
-            "next_scan": None,
+            "next_scan": next_scan,
             "last_scan": last,
             "claude_calls": {"used": self._claude_calls_today, "limit": max_calls},
         }
@@ -212,8 +215,19 @@ class Trader:
         except Exception as exc:
             logging.debug("Failed to persist candidates: %s", exc)
 
+    def _touch_heartbeat(self) -> None:
+        """Write heartbeat timestamp for ATLAS process liveness checks."""
+        try:
+            (DATA_DIR / "heartbeat.ts").write_text(
+                datetime.now(timezone.utc).isoformat(),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logging.debug("heartbeat write failed: %s", exc)
+
     def run_full_pipeline(self) -> None:
         """Run one full scan: collect markets, evaluate math, call Claude once, trade."""
+        self._touch_heartbeat()
         self._reload_config_if_dirty()
         self.paused = is_paused()
         if self.paused:

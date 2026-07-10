@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import logging
 import os
 import re
@@ -21,7 +22,7 @@ from typing import Any, Callable
 
 import zoneinfo
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request, send_file
+from flask import Flask, Response, abort, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +71,57 @@ STATIONS = [
 ]
 
 atlas = Flask(__name__, static_folder=None)
-CORS(atlas, origins=["null", r"http://localhost:*", r"http://127.0.0.1:*"], supports_credentials=False)
+CORS(
+    atlas,
+    resources={
+        r"/api/*": {
+            "origins": [
+                "null",
+                r"http://localhost:*",
+                r"http://127.0.0.1:*",
+                r"http://192.168.*",
+                r"http://10.*",
+            ],
+        },
+    },
+    allow_headers=["Content-Type", "X-Atlas-Secret"],
+    methods=["GET", "POST", "OPTIONS"],
+    max_age=600,
+    supports_credentials=False,
+)
+
+DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET", "")
+_MUTATE_LAST: dict[str, float] = {}
+_MUTATE_LOCK = threading.Lock()
+_MUTATE_MIN_INTERVAL = 0.5
+
+
+def check_secret() -> None:
+    """Fail closed unless X-Atlas-Secret matches DASHBOARD_SECRET."""
+    if not DASHBOARD_SECRET:
+        abort(500, description="DASHBOARD_SECRET not configured")
+    sent = request.headers.get("X-Atlas-Secret", "")
+    if not hmac.compare_digest(sent, DASHBOARD_SECRET):
+        abort(401, description="Unauthorized")
+
+
+@atlas.before_request
+def _atlas_before_request() -> Any:
+    """Auth POST mutations and rate-limit control endpoints."""
+    if request.method == "OPTIONS":
+        return None
+    path = request.path
+    if request.method == "POST" and path.startswith("/api/"):
+        check_secret()
+        if path in ("/api/control", "/api/sell"):
+            ip = request.remote_addr or "unknown"
+            now = time.monotonic()
+            with _MUTATE_LOCK:
+                last = _MUTATE_LAST.get(ip, 0.0)
+                if now - last < _MUTATE_MIN_INTERVAL:
+                    return _err("Rate limited — wait before retrying", 429)
+                _MUTATE_LAST[ip] = now
+    return None
 
 
 def _ts() -> str:
@@ -100,7 +151,9 @@ def _cached(key: str, ttl: float, fn: Callable[[], Any]) -> Any:
 
 def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=5)
-    conn.execute("PRAGMA busy_timeout=3000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -323,13 +376,29 @@ def _write_env_key(key: str, value: str) -> None:
 
 # --- Routes ---
 
+DASHBOARD_DIST = PROJECT_ROOT / "dashboard" / "dist"
+
+
 @atlas.route("/")
 def dashboard():
-    """Serve the single-file React dashboard."""
-    dash = PROJECT_ROOT / "dashboard" / "index.html"
-    if not dash.exists():
-        return _err("Dashboard not found", 404)
-    return send_file(dash)
+    """Serve the Vite-built React dashboard (run `pnpm build` in dashboard/)."""
+    built = DASHBOARD_DIST / "index.html"
+    if built.exists():
+        return send_file(built)
+    # ATLAS-NOTE: fallback to Vite dev index when dist not built yet
+    dev_index = PROJECT_ROOT / "dashboard" / "index.html"
+    if dev_index.exists():
+        return _err("Dashboard not built — run `cd dashboard && pnpm build`", 503)
+    return _err("Dashboard not found", 404)
+
+
+@atlas.route("/assets/<path:filename>")
+def dashboard_assets(filename: str):
+    """Serve Vite build assets."""
+    assets_dir = DASHBOARD_DIST / "assets"
+    if not assets_dir.exists():
+        return _err("Dashboard assets not found — run pnpm build", 404)
+    return send_from_directory(assets_dir, filename)
 
 
 @atlas.route("/api/agents/register", methods=["POST"])
@@ -368,11 +437,55 @@ def agents_list():
         return _ok(list(AGENTS.values()))
 
 
+def _bot_process_status() -> dict[str, Any]:
+    """Truthful process status from PID file, heartbeat, and agent registry."""
+    from src.bot_controller import BotController
+
+    ctrl = BotController()
+    proc_status = ctrl.status()
+    pid = ctrl.pid()
+    next_scan_at = None
+    heartbeat_age_s = None
+    hb_path = DATA_DIR / "heartbeat.ts"
+    if hb_path.exists():
+        try:
+            raw = hb_path.read_text(encoding="utf-8").strip()
+            ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            heartbeat_age_s = round((datetime.now(timezone.utc) - ts).total_seconds(), 1)
+        except Exception:
+            pass
+    with _agents_lock:
+        agent = AGENTS.get("whetherbot") or {}
+    if agent.get("next_scan"):
+        next_scan_at = agent["next_scan"]
+    elif agent.get("last_scan", {}).get("ts"):
+        try:
+            last = datetime.fromisoformat(str(agent["last_scan"]["ts"]).replace("Z", "+00:00"))
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "30"))
+            next_scan_at = (last + timedelta(minutes=interval)).astimezone(ET).isoformat()
+        except Exception:
+            pass
+    merged_status = proc_status
+    if proc_status == "running" and agent.get("status") == "paused":
+        merged_status = "paused"
+    return {
+        "process_status": merged_status,
+        "pid": pid,
+        "heartbeat_age_s": heartbeat_age_s,
+        "next_scan_at": next_scan_at,
+    }
+
+
 @atlas.route("/api/status")
 def api_status():
     _mark_stale_agents()
     with _agents_lock:
         agents = list(AGENTS.values())
+    bot_proc = _bot_process_status()
     return _ok({
         "mode": _mode_label(),
         "killswitch": _killswitch_active(),
@@ -392,6 +505,10 @@ def api_status():
         "open_positions": int(_scalar("SELECT COUNT(*) FROM positions WHERE status='open' AND dry_run=0")),
         "max_positions": _dynamic_max_positions(),
         "agents": agents,
+        "bot_process_status": bot_proc["process_status"],
+        "bot_pid": bot_proc["pid"],
+        "heartbeat_age_s": bot_proc["heartbeat_age_s"],
+        "next_scan_at": bot_proc["next_scan_at"],
     })
 
 
@@ -1023,9 +1140,9 @@ def atlas_chat():
         return _err("anthropic package not installed", 500)
 
     client = anthropic.Anthropic(api_key=api_key)
-    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-    if "haiku" in model:
-        model = "claude-sonnet-4-20250514"  # ATLAS-NOTE: spec requests Sonnet for assistant
+    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+    if "haiku" in model.lower():
+        model = "claude-sonnet-5"
 
     tools = [
         {"name": "get_positions", "description": "Open positions", "input_schema": {"type": "object", "properties": {}}},
@@ -1039,6 +1156,9 @@ def atlas_chat():
     ]
 
     system = _build_system_prompt()
+    system_block: list[dict[str, Any]] = [{"type": "text", "text": system}]
+    if len(system) > 4000:
+        system_block[0]["cache_control"] = {"type": "ephemeral"}
     handlers = _tool_handlers()
     mutating = {"control_bot", "sell_position"}
 
@@ -1047,7 +1167,7 @@ def atlas_chat():
             with client.messages.stream(
                 model=model,
                 max_tokens=2000,
-                system=system,
+                system=system_block,
                 messages=[{"role": m["role"], "content": m["content"]} for m in messages[-20:]],
                 tools=tools,
             ) as stream:
@@ -1080,7 +1200,10 @@ def atlas_chat():
             logging.exception("atlas chat error")
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
 
-    return Response(generate(), mimetype="text/event-stream")
+    resp = Response(generate(), mimetype="text/event-stream")
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 @atlas.route("/api/atlas/confirm", methods=["POST"])
@@ -1106,12 +1229,19 @@ def atlas_confirm():
         return _err(str(exc), 500)
 
 
-def run_api(host: str = "127.0.0.1", port: int | None = None) -> None:
-    """Start the Flask development server (bind localhost only)."""
+def run_api(host: str | None = None, port: int | None = None) -> None:
+    """Start the ATLAS API server (waitress in production, Flask dev server otherwise)."""
     _load_agents()
+    if host is None:
+        host = "0.0.0.0" if os.getenv("ATLAS_LAN", "0").strip() == "1" else "127.0.0.1"
     port = port or int(os.getenv("ATLAS_PORT", "5000"))
-    logging.info("ATLAS dashboard: http://localhost:%d", port)
-    atlas.run(host=host, port=port, threaded=True, use_reloader=False)
+    logging.info("ATLAS dashboard: http://%s:%d", host, port)
+    if os.getenv("ATLAS_PRODUCTION", "0").strip() == "1":
+        from waitress import serve
+
+        serve(atlas, host=host, port=port, threads=8)
+    else:
+        atlas.run(host=host, port=port, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":

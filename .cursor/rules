@@ -117,17 +117,19 @@ This is a live Kalshi prediction market trading bot called WhetherBot running on
 - Never bet on contracts below $0.15 — fee drag destroys edge
 - Never place more than one bet per ticker per day
 
-## DASHBOARD / FLASK API RULES (new)
-- Flask API runs on port 5000 on the ThinkPad alongside the bot
-- All API endpoints return JSON with consistent shape: {success: bool, data: any, error: str|null}
-- Dashboard is a single HTML file at dashboard/index.html
-- Dashboard polls /api/status every 30s, /api/metar every 5min, /api/logs every 10s
+## DASHBOARD / FLASK API RULES
+- Flask API runs on port 5000 (ATLAS_PORT) alongside the bot
+- All API endpoints return JSON: `{ok: bool, data: any, error: str|null, ts: str}`
+- Dashboard is React/Vite in `dashboard/` — build with `pnpm build`, served from Flask or Vite dev proxy
+- Dashboard polls via `usePoller`: status 15s, positions/balance 30s, metar 5min, logs 60s
 - Dark theme only — no light mode
-- Never expose API keys or .env values through the Flask API
-- Flask API is read-only for all GET endpoints — no state mutations via GET
-- All POST endpoints require a simple shared secret header (DASHBOARD_SECRET from .env)
-- Dashboard must work when bot is stopped — show "offline" state gracefully
-- Multi-agent support: each bot registers at /api/agents/register on startup
+- Never expose API keys or .env values through the Flask API (redact KEY/SECRET/TOKEN/PASSWORD)
+- Flask GET endpoints are read-only — no state mutations via GET
+- All POST endpoints require `X-Atlas-Secret` header matching `DASHBOARD_SECRET` (hmac.compare_digest, fail closed)
+- Frontend sends secret via `VITE_DASHBOARD_SECRET` in `dashboard/.env.local`
+- Dashboard must work when bot is stopped — show offline/stale state with BotController fallback controls
+- Multi-agent support: each bot registers at `/api/agents/register` on startup (POST with secret)
+- See `docs/ATLAS_OVERHAUL.md` for CORS, SSE chat, PID/heartbeat, and JOIN correctness rules
 
 ## CALIBRATION LOOP RULES
 - Every confirmed fill must create a calibration_log entry immediately

@@ -701,7 +701,11 @@ class RiskManager:
 
     def _connect(self) -> sqlite3.Connection:
         """Open a SQLite connection to the positions database."""
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
     @staticmethod
     def _now() -> str:
