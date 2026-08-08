@@ -213,26 +213,31 @@ class ContractValidator:
                 )
 
             # If cap equals floor (Kalshi API bug/change) or is missing, derive from ticker.
+            # Example: KXHIGHNY-26AUG08-B89.5 → center 89.5 → bracket [89, 90].
             if confirmed_upper is None or confirmed_upper <= confirmed_threshold:
-                # Parse bracket center from ticker — e.g. B89.5 → center 89.5
-                # Kalshi between brackets are typically 1°F wide: floor..floor+1
                 bracket_match = re.search(r"-B(\d+(?:\.\d+)?)", ticker)
-                if bracket_match:
-                    center = float(bracket_match.group(1))
-                    # Use floor_strike as the lower bound, add 1°F for cap
-                    confirmed_upper = confirmed_threshold + 1.0
-                    logging.debug(
-                        "[VALIDATOR] Derived cap_strike=%.1f from ticker %s "
-                        "(API returned equal/missing floor/cap; center=%.1f)",
-                        confirmed_upper,
-                        ticker,
-                        center,
-                    )
-                else:
+                if not bracket_match:
                     return ValidationResult(
                         valid=False,
                         reason=f"Between market {ticker} cannot determine bracket bounds",
                     )
+                center = float(bracket_match.group(1))
+                # Half-degree centers (B89.5): [center-0.5, center+0.5]
+                # Integer centers (B90): [center, center+1]
+                if center != int(center):
+                    confirmed_threshold = center - 0.5
+                    confirmed_upper = center + 0.5
+                else:
+                    confirmed_threshold = float(center)
+                    confirmed_upper = float(center) + 1.0
+                logging.info(
+                    "[VALIDATOR] Derived bracket floor=%.1f cap=%.1f from ticker %s "
+                    "(API floor/cap equal or missing; center=%.1f)",
+                    confirmed_threshold,
+                    confirmed_upper,
+                    ticker,
+                    center,
+                )
 
             if confirmed_upper <= confirmed_threshold:
                 return ValidationResult(
