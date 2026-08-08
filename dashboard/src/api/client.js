@@ -50,7 +50,7 @@ export async function api(path, { method = "GET", body, signal } = {}) {
       method: upper,
       headers: {
         ...(body != null ? { "Content-Type": "application/json" } : {}),
-        ...(upper !== "GET" && upper !== "HEAD" && SECRET ? { "X-Atlas-Secret": SECRET } : {}),
+        ...(SECRET ? { "X-Atlas-Secret": SECRET } : {}),
       },
       body: body != null ? JSON.stringify(body) : undefined,
       signal,
