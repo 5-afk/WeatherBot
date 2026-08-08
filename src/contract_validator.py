@@ -9,6 +9,7 @@ that would cause the pipeline to produce confidently wrong answers.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -157,7 +158,23 @@ class ContractValidator:
         if floor_strike is not None:
             try:
                 api_floor = float(floor_strike)
-                if threshold is not None and abs(threshold - api_floor) > 1.0:
+                # ATLAS-NOTE: For between markets always prefer API floor_strike.
+                # Title/subtitle parsing takes the last number in "89-90°", so
+                # threshold often equals cap_strike and the old abs(diff)>1.0
+                # guard never corrected a 1°F off-by-one (90 vs 89).
+                if strike_type == "between":
+                    if threshold is not None and abs(threshold - api_floor) > 0.01:
+                        # Common: title "89-90°" parses as 90 while floor_strike is 89.
+                        log_fn = logging.warning if abs(threshold - api_floor) > 1.0 else logging.debug
+                        log_fn(
+                            "[VALIDATOR] Threshold mismatch for %s: "
+                            "parsed=%.1f API floor_strike=%.1f — using API value",
+                            ticker,
+                            threshold,
+                            api_floor,
+                        )
+                    confirmed_threshold = api_floor
+                elif threshold is not None and abs(threshold - api_floor) > 1.0:
                     logging.warning(
                         "[VALIDATOR] Threshold mismatch for %s: "
                         "parsed=%.1f API floor_strike=%.1f — using API value",
@@ -172,27 +189,51 @@ class ContractValidator:
         if cap_strike is not None and strike_type == "between":
             try:
                 api_cap = float(cap_strike)
-                if upper_threshold is not None and abs(upper_threshold - api_cap) > 1.0:
-                    logging.warning(
-                        "[VALIDATOR] Upper threshold mismatch for %s: "
-                        "parsed=%.1f API cap_strike=%.1f — using API value",
-                        ticker,
-                        upper_threshold,
-                        api_cap,
-                    )
+                if confirmed_threshold is None or api_cap > confirmed_threshold:
+                    if upper_threshold is not None and abs(upper_threshold - api_cap) > 1.0:
+                        logging.warning(
+                            "[VALIDATOR] Upper threshold mismatch for %s: "
+                            "parsed=%.1f API cap_strike=%.1f — using API value",
+                            ticker,
+                            upper_threshold,
+                            api_cap,
+                        )
                     confirmed_upper = api_cap
+                else:
+                    # Equal/inverted API floor & cap — clear so derivation runs below.
+                    confirmed_upper = None
             except (ValueError, TypeError):
                 pass
 
         if strike_type == "between":
-            if confirmed_threshold is None or confirmed_upper is None:
+            if confirmed_threshold is None:
                 return ValidationResult(
                     valid=False,
-                    reason=(
-                        f"Between market {ticker} missing floor or cap strike — "
-                        "cannot calculate bracket probability"
-                    ),
+                    reason="Between market missing floor_strike",
                 )
+
+            # If cap equals floor (Kalshi API bug/change) or is missing, derive from ticker.
+            if confirmed_upper is None or confirmed_upper <= confirmed_threshold:
+                # Parse bracket center from ticker — e.g. B89.5 → center 89.5
+                # Kalshi between brackets are typically 1°F wide: floor..floor+1
+                bracket_match = re.search(r"-B(\d+(?:\.\d+)?)", ticker)
+                if bracket_match:
+                    center = float(bracket_match.group(1))
+                    # Use floor_strike as the lower bound, add 1°F for cap
+                    confirmed_upper = confirmed_threshold + 1.0
+                    logging.debug(
+                        "[VALIDATOR] Derived cap_strike=%.1f from ticker %s "
+                        "(API returned equal/missing floor/cap; center=%.1f)",
+                        confirmed_upper,
+                        ticker,
+                        center,
+                    )
+                else:
+                    return ValidationResult(
+                        valid=False,
+                        reason=f"Between market {ticker} cannot determine bracket bounds",
+                    )
+
             if confirmed_upper <= confirmed_threshold:
                 return ValidationResult(
                     valid=False,
